@@ -10,13 +10,16 @@
 # Host:    Auf dem Proxmox-Host als root ausführen:
 #          bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
 #
-set -euo pipefail
+# -E ist Pflicht: ohne -E wird der ERR-Trap NICHT in Funktionen/Subshells vererbt
+# (Folge: stiller Abbruch ohne Fehlerkette). Siehe Regressionstest mit Mock-pct.
+set -Eeuo pipefail
 
 # ============================================================================
 # VARIABLEN (oben, Community-Scripts-konform – alles per ENV/Flag überschreibbar)
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.0.1}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -58,11 +61,13 @@ HEALTH_WAIT_SECS="${HEALTH_WAIT_SECS:-240}"
 # FARBEN / LOGGING (Community-Scripts-Stil)
 # ============================================================================
 YW="\033[33m"; GN="\033[1;92m"; RD="\033[01;31m"; CL="\033[m"; BGN="\033[4;92m"
-msg_info()  { echo -e "${YW} ● $*${CL}"; }
-msg_ok()    { echo -e "${GN} ✓ $*${CL}"; }
+# HINWEIS: Alle Fortschrittsmeldungen gehen nach stderr – stdout ist für Daten
+# reserviert (z. B. template=$(ensure_template) darf NUR den Pfad enthalten).
+msg_info()  { echo -e "${YW} ● $*${CL}" >&2; }
+msg_ok()    { echo -e "${GN} ✓ $*${CL}" >&2; }
 msg_error() { echo -e "${RD} ✗ $*${CL}" >&2; }
 
-log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
 
 usage() {
   cat <<EOF
@@ -91,6 +96,7 @@ error_trap() {
   echo -e "${YW}--- Fehlermeldungskette (vollständig) ---${CL}" >&2
   echo "  Befehl    : ${failed_cmd}" >&2
   echo "  Exit-Code : ${exit_code}" >&2
+  echo "  Pipe-Status: ${PIPESTATUS[*]:-n/a} (bei Pipelines: Austrittscodes aller Glieder)" >&2
   echo "  Zeile     : ${BASH_LINENO[0]:-?} (Funktion: ${FUNCNAME[1]:-main})" >&2
   echo "  Stacktrace:" >&2
   local i=0 frame
@@ -124,7 +130,7 @@ check_host() {
   command -v pct >/dev/null && command -v pvesh >/dev/null \
     || { msg_error "pct/pvesh nicht gefunden – Skript muss auf dem Proxmox VE Host laufen."; exit 1; }
   touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/${APP}-install.log"
-  log "== ${APP_FRIENDLY} Installation startet (MODE=${MODE}) =="
+  log "== ${APP_FRIENDLY} Installation startet (MODE=${MODE}, script v${SCRIPT_VERSION}) =="
 }
 
 parse_args() {
@@ -166,7 +172,9 @@ ensure_template() {
   msg_info "Aktualisiere Template-Liste (${TEMPLATE_STORAGE})"
   pveam update 2>&1 | tee -a "$LOG_FILE" >/dev/null || true
   local tpl
-  tpl=$(pveam available --section system 2>/dev/null | grep -o "${VAR_OS_TEMPLATE}[^\s]*amd64[^\s]*" | sort -V | tail -n1 || true)
+  # HINWEIS: [^[:space:]] statt [^\s] – letzteres frisst buchstäblich jedes 's'
+  # und verstümmelt den Dateinamen zu '...tar.z' statt '...tar.zst'.
+  tpl=$(pveam available --section system 2>/dev/null | grep -o "${VAR_OS_TEMPLATE}[^[:space:]]*amd64[^[:space:]]*" | sort -V | tail -n1 || true)
   if [[ -z "$tpl" ]]; then
     msg_error "Kein Template für '${VAR_OS_TEMPLATE}' gefunden. Verfügbare Debian-Templates:"
     pveam available --section system 2>/dev/null | grep -i debian | tee -a "$LOG_FILE" || true
@@ -197,6 +205,11 @@ ct_ip() {
   pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true
 }
 
+# Wird von create_container() gesetzt: 1 = Container existierte bereits (Update-Pfad).
+# HINWEIS: create_container() MUSS direkt (nicht in if/while/&&/||) aufgerufen werden,
+# sonst sind set -e und ERR-Trap im Funktionskörper deaktiviert und Fehler laufen still durch.
+CT_ALREADY_EXISTS=0
+
 create_container() {
   local template="$1"
   if pct status "$CTID" >/dev/null 2>&1; then
@@ -207,10 +220,13 @@ create_container() {
       pct destroy "$CTID" --purge 1 2>&1 | tee -a "$LOG_FILE"
     else
       msg_info "Container ${CTID} existiert bereits → idempotentes Update (kein Neuaufbau)"
-      return 1  # 1 = existiert schon
+      CT_ALREADY_EXISTS=1
+      return 0
     fi
   fi
   msg_info "Erstelle LXC-Container ${CTID} (${HOSTNAME_CT}: ${VAR_CPU} vCPU, ${VAR_RAM} MB RAM, ${VAR_DISK} GB Disk)"
+  # pipefail ist aktiv: schlägt pct create fehl, bricht das Script hier per ERR-Trap
+  # mit kompletter Diagnostik ab (Fail-Fast statt 90s Warteschleife ins Leere).
   pct create "$CTID" "$template" \
     --hostname "$HOSTNAME_CT" \
     --cores "$VAR_CPU" --memory "$VAR_RAM" --swap 512 \
@@ -224,12 +240,23 @@ create_container() {
     --password "$(openssl rand -base64 12)" \
     2>&1 | tee -a "$LOG_FILE"
   # onboot explizit sicherstellen (reboot-sicher)
-  pct set "$CTID" --onboot 1 2>&1 | tee -a "$LOG_FILE" || true
+  pct set "$CTID" --onboot 1 2>&1 | tee -a "$LOG_FILE"
+  # Fail-Fast: Config muss jetzt existieren, sonst sofort abbrechen statt Geister-Jagd.
+  if ! pct config "$CTID" >/dev/null 2>&1; then
+    msg_error "Container ${CTID} hat nach 'pct create' keine Config – Details:"
+    pct config "$CTID" || true
+    exit 1
+  fi
   msg_ok "Container ${CTID} erstellt (onboot=1)"
-  return 0
 }
 
 wait_container() {
+  # Fail-Fast: ohne Config keine 90s Warteschleife.
+  if ! pct config "$CTID" >/dev/null 2>&1; then
+    msg_error "Container ${CTID} existiert nicht (keine Config unter nodes/*/lxc/${CTID}.conf). Breche ab."
+    pct config "$CTID" || true
+    exit 1
+  fi
   msg_info "Warte auf Container-Netzwerk (max. 90s)"
   for i in $(seq 1 45); do
     if pct exec "$CTID" -- bash -c "ping -c1 -W2 1.1.1.1 >/dev/null 2>&1"; then
@@ -260,7 +287,8 @@ install_in_container() {
     "CONTAINER_IP=${container_ip}" \
     "TIMEZONE=${TIMEZONE}" \
     bash -s 2>&1 <<'IN_CT_EOF' | tee -a "$LOG_FILE"
-set -euo pipefail
+# -E wichtig: sonst feuert der ERR-Trap in Funktionen/Subshells nicht (stiller Abbruch).
+set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 echo "--- [CT] OS-Update ---"
 apt-get update
@@ -526,8 +554,24 @@ main() {
   if [[ "$MODE" == "vm" ]]; then install_vm_mode; fi
   local template
   template=$(ensure_template)
-  if create_container "$template"; then log "Container neu erstellt"; else log "Bestands-Container → Update-Pfad"; fi
-  if [[ "$START_AFTER_CREATE" == "1" ]]; then pct start "$CTID" 2>/dev/null || true; fi
+  # Sanity-Check: stdout von ensure_template() muss EXAKT ein Template-Pfad sein
+  # (schützt vor stdout-Verschmutzung: 'can't find file'-Fehler wie in v1.0.0).
+  if [[ "$template" != *":vztmpl/"*".tar"* ]]; then
+    msg_error "Ungültiger Template-Pfad von ensure_template(): '${template}'"
+    msg_error "Erwartet: '<storage>:vztmpl/<name>.tar.zst' in EINER Zeile."
+    exit 1
+  fi
+  log "Template: ${template}"
+  # DIREKTER Aufruf (kein if/||-Kontext) – nur so greifen set -e + ERR-Trap (Fail-Fast).
+  create_container "$template"
+  if [[ "$CT_ALREADY_EXISTS" == "1" ]]; then log "Bestands-Container → Update-Pfad"; else log "Container neu erstellt"; fi
+  # Nur starten, wenn nicht bereits laufend ('pct start' auf laufendem CT schlägt fehl).
+  if pct status "$CTID" 2>/dev/null | grep -q "running"; then
+    msg_ok "Container ${CTID} läuft bereits"
+  else
+    msg_info "Starte Container ${CTID}"
+    pct start "$CTID" 2>&1 | tee -a "$LOG_FILE"
+  fi
   wait_container
   sleep 5
   local ip
