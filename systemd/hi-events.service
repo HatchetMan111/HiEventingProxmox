@@ -1,0 +1,19 @@
+[Unit]
+Description=Hi.Events All-in-One (Docker Compose)
+Documentation=https://github.com/HiEventsDev/hi.events
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hi-events
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
