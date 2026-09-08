@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.0.1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.1.0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -44,6 +44,13 @@ TIMEZONE="${TIMEZONE:-Europe/Berlin}"
 WEB_PORT="${WEB_PORT:-8123}"                       # Web UI Port (Container + Host-Seite identisch)
 APP_DIR="${APP_DIR:-/opt/hi-events}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"         # leer = zufällig generieren (idempotent: bleibt erhalten)
+# --- Admin-Zugang (Upstream hat KEIN Default-Login → Installer legt einen Admin an) ---
+ADMIN_EMAIL="${ADMIN_EMAIL:-}"                     # leer = interaktiv abfragen (TTY) bzw. Default unten
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"               # leer = abfragen/generieren (Hi.Events-Policy: min. 8 Zeichen)
+ADMIN_FIRSTNAME="${ADMIN_FIRSTNAME:-Admin}"
+ADMIN_LASTNAME="${ADMIN_LASTNAME:-User}"
+ADMIN_DEFAULT_EMAIL="${ADMIN_DEFAULT_EMAIL:-admin@hi-events.local}"
+SKIP_ADMIN_SETUP="${SKIP_ADMIN_SETUP:-0}"          # 1 = kein Admin anlegen (nur Stack installieren)
 REINSTALL="${REINSTALL:-0}"                        # 1 = Container bei Existenz neu erstellen (DATENVERLUST)
 MODE="${MODE:-lxc}"                                # "lxc" (Standard) oder "vm" (leistungshungrig / kein nesting)
 VM_CPU="${VM_CPU:-2}"
@@ -78,10 +85,13 @@ Verwendung:
   # oder lokal:
   CTID=101 ./install/hi-events.sh [--ctid 101] [--cpu 2] [--ram 4096] [--disk 12]
                                   [--storage local-lvm] [--bridge vmbr0] [--ip dhcp]
-                                  [--vm] [--reinstall] [--uninstall] [-h]
+                                  [--vm] [--reinstall] [--skip-admin] [--uninstall] [-h]
 
 ENV-Overrides: CTID HOSTNAME_CT VAR_CPU VAR_RAM VAR_DISK CONTAINER_STORAGE TEMPLATE_STORAGE
                BRIDGE NET_CONFIG HI_EVENTS_IMAGE POSTGRES_PASSWORD MODE=vm REINSTALL=1
+               ADMIN_EMAIL ADMIN_PASSWORD ADMIN_FIRSTNAME ADMIN_LASTNAME SKIP_ADMIN_SETUP=1
+Admin: Ohne ENV wird interaktiv gefragt (E-Mail + Passwort, min. 8 Zeichen);
+       ohne TTY wird generiert und am Ende angezeigt.
 EOF
 }
 
@@ -146,6 +156,7 @@ parse_args() {
       --ip)         NET_CONFIG="$2"; shift 2 ;;
       --vm)         MODE="vm"; shift ;;
       --reinstall)  REINSTALL="1"; shift ;;
+      --skip-admin) SKIP_ADMIN_SETUP="1"; shift ;;
       --uninstall)  do_uninstall; exit 0 ;;
       -h|--help)    usage; exit 0 ;;
       *) msg_error "Unbekannte Option: $1"; usage; exit 1 ;;
@@ -293,7 +304,7 @@ export DEBIAN_FRONTEND=noninteractive
 echo "--- [CT] OS-Update ---"
 apt-get update
 apt-get upgrade -y
-apt-get install -y ca-certificates curl git openssl gnupg lsb-release
+apt-get install -y ca-certificates curl git openssl gnupg lsb-release python3
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "--- [CT] Installiere Docker ---"
@@ -329,6 +340,15 @@ VITE_STRIPE_PUBLISHABLE_KEY=pk_test_123456789
 VITE_APP_NAME=Hi.Events
 LOG_CHANNEL=stderr
 QUEUE_CONNECTION=redis
+# --- Login-Fix für HTTP/IP-Zugriff (Upstream-Issue #472: Login-200, danach 401) ---
+# APP_URL speist u. a. Sanctums stateful-Domains; SANCTUM_STATEFUL_DOMAINS explizit
+# dazu (Browser-Referer IP:Port muss als stateful gelten, sonst 401 auf /users/me).
+# SESSION_SECURE_COOKIE=false: sonst verwirft der Browser Cookies über http.
+# SESSION_DOMAIN bewusst NICHT gesetzt (null = Host-only-Cookie; eine IP als
+# Cookie-Domain lehnen moderne Browser ab → Session geht verloren).
+APP_URL=http://${CONTAINER_IP}:${WEB_PORT}
+SANCTUM_STATEFUL_DOMAINS=${CONTAINER_IP}:${WEB_PORT}
+SESSION_SECURE_COOKIE=false
 APP_CDN_URL=http://${CONTAINER_IP}:${WEB_PORT}/storage
 APP_FRONTEND_URL=http://${CONTAINER_IP}:${WEB_PORT}
 APP_DISABLE_REGISTRATION=false
@@ -367,11 +387,20 @@ EOF2
   echo "[CT] .env erzeugt (APP_KEY/JWT_SECRET/POSTGRES_PASSWORD zufällig)."
 else
   echo "--- [CT] .env existiert bereits → Secrets bleiben erhalten (idempotent) ---"
-  # Frontend-URL bei IP-Wechsel nachziehen, Secrets NICHT anfassen:
-  sed -i -E "s|^VITE_FRONTEND_URL=.*|VITE_FRONTEND_URL=http://${CONTAINER_IP}:${WEB_PORT}|" .env
-  sed -i -E "s|^VITE_API_URL_CLIENT=.*|VITE_API_URL_CLIENT=http://${CONTAINER_IP}:${WEB_PORT}/api|" .env
-  sed -i -E "s|^APP_CDN_URL=.*|APP_CDN_URL=http://${CONTAINER_IP}:${WEB_PORT}/storage|" .env
-  sed -i -E "s|^APP_FRONTEND_URL=.*|APP_FRONTEND_URL=http://${CONTAINER_IP}:${WEB_PORT}|" .env
+  # Frontend-/Backend-URLs bei IP-Wechsel nachziehen, Secrets NICHT anfassen:
+  upsert_env() { # $1=KEY $2=VALUE – ersetzen oder anhängen (nur für URL-/Flag-Werte!)
+    if grep -qE "^${1}=" .env; then sed -i -E "s|^${1}=.*|${1}=${2}|" .env
+    else printf '%s=%s\n' "${1}" "${2}" >> .env; fi
+  }
+  upsert_env VITE_FRONTEND_URL "http://${CONTAINER_IP}:${WEB_PORT}"
+  upsert_env VITE_API_URL_CLIENT "http://${CONTAINER_IP}:${WEB_PORT}/api"
+  upsert_env APP_CDN_URL "http://${CONTAINER_IP}:${WEB_PORT}/storage"
+  upsert_env APP_FRONTEND_URL "http://${CONTAINER_IP}:${WEB_PORT}"
+  upsert_env APP_URL "http://${CONTAINER_IP}:${WEB_PORT}"
+  upsert_env SANCTUM_STATEFUL_DOMAINS "${CONTAINER_IP}:${WEB_PORT}"
+  upsert_env SESSION_SECURE_COOKIE "false"
+  # SESSION_DOMAIN ggf. aus Alt-Installationen entfernen (IP als Domain killt Cookies):
+  sed -i -E "/^SESSION_DOMAIN=/d" .env
 fi
 
 # --- docker-compose.yml (immer auf gewünschtes Image pinnen, Volumes bleiben) ---
@@ -388,6 +417,9 @@ services:
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://\${POSTGRES_USER:-postgres}:\${POSTGRES_PASSWORD:-secret}@postgres:5432/\${POSTGRES_DB:-hi-events}
+      - APP_URL=\${APP_URL}
+      - SANCTUM_STATEFUL_DOMAINS=\${SANCTUM_STATEFUL_DOMAINS}
+      - SESSION_SECURE_COOKIE=\${SESSION_SECURE_COOKIE:-false}
       - REDIS_HOST=redis
       - REDIS_PASSWORD=
       - REDIS_PORT=6379
@@ -495,6 +527,196 @@ install_vm_mode() {
 }
 
 # ============================================================================
+# ADMIN-ZUGANG (Upstream liefert KEIN Default-Login – Installer legt Admin an)
+# Ablauf: Zugangsdaten abfragen → per API registrieren (valide Timezone, kein
+# 422-Bug) → E-Mail vorab verifizieren (MAIL_MAILER=log!) → SUPERADMIN-Rolle
+# via artisan (SQL-Fallback) → Login-Beweis: POST /auth/login 200 + /users/me 200.
+# Das Passwort steht NUR auf dem Terminal, nie in Logdateien.
+# ============================================================================
+ADMIN_EMAIL_FINAL=""; ADMIN_PASSWORD_FINAL=""; ADMIN_ACCOUNT_ID=""; ADMIN_USER_ID=""
+
+prompt_admin_credentials() {
+  if [[ "$SKIP_ADMIN_SETUP" == "1" ]]; then
+    log "SKIP_ADMIN_SETUP=1 – es wird kein Admin angelegt."
+    return 1
+  fi
+  if [[ -z "${ADMIN_EMAIL:-}" ]]; then
+    if [[ -t 0 ]]; then
+      local _em=""
+      read -r -p "Admin-E-Mail [${ADMIN_DEFAULT_EMAIL}]: " _em < /dev/tty || true
+      ADMIN_EMAIL_FINAL="${_em:-$ADMIN_DEFAULT_EMAIL}"
+    else
+      ADMIN_EMAIL_FINAL="$ADMIN_DEFAULT_EMAIL"
+      log "Kein TTY → Admin-Default-E-Mail: ${ADMIN_EMAIL_FINAL}"
+    fi
+  else
+    ADMIN_EMAIL_FINAL="$ADMIN_EMAIL"
+  fi
+  [[ "$ADMIN_EMAIL_FINAL" == *"@"* && "$ADMIN_EMAIL_FINAL" == *"."* ]] \
+    || { msg_error "Ungültige Admin-E-Mail: '${ADMIN_EMAIL_FINAL}'"; exit 1; }
+  if [[ -z "${ADMIN_PASSWORD:-}" ]]; then
+    if [[ -t 0 ]]; then
+      local _pw=""
+      while true; do
+        read -r -s -p "Admin-Passwort (min. 8 Zeichen, leer = zufällig generieren): " _pw < /dev/tty || true
+        echo >&2
+        if [[ -z "$_pw" ]]; then
+          ADMIN_PASSWORD_FINAL="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          log "Admin-Passwort zufällig generiert (Anzeige am Ende, NICHT im Log)."
+          break
+        fi
+        if [[ "${#_pw}" -ge 8 ]]; then ADMIN_PASSWORD_FINAL="$_pw"; break; fi
+        msg_error "Zu kurz (Hi.Events-Policy: min. 8 Zeichen). Nochmal."
+      done
+    else
+      ADMIN_PASSWORD_FINAL="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
+      log "Kein TTY → Admin-Passwort generiert (Anzeige am Ende, NICHT im Log)."
+    fi
+  else
+    [[ "${#ADMIN_PASSWORD}" -ge 8 ]] || { msg_error "ADMIN_PASSWORD zu kurz (min. 8 Zeichen)."; exit 1; }
+    ADMIN_PASSWORD_FINAL="$ADMIN_PASSWORD"
+  fi
+  log "Admin-Account: ${ADMIN_EMAIL_FINAL} (Name: ${ADMIN_FIRSTNAME:-Admin} ${ADMIN_LASTNAME:-User})"
+  return 0
+}
+
+setup_admin() {
+  local ip="$1"
+  prompt_admin_credentials || return 0   # SKIP → kein Admin, kein Fehler
+  msg_info "Lege Admin-Account an (${ADMIN_EMAIL_FINAL}) + Login-Beweis via API"
+
+  local result_line
+  # NUR die ADMIN_RESULT-Zeile steht auf stdout (grep = Fail-Fast-Assertion);
+  # Fortschritt läuft über stderr+Log. Das Passwort erscheint nirgends.
+  result_line=$(pct exec "$CTID" -- env \
+    "APP_DIR=${APP_DIR}" \
+    "WEB_PORT=${WEB_PORT}" \
+    "API_BASE=http://localhost:${WEB_PORT}/api" \
+    "ADMIN_EMAIL=${ADMIN_EMAIL_FINAL}" \
+    "ADMIN_PASSWORD=${ADMIN_PASSWORD_FINAL}" \
+    "ADMIN_FIRSTNAME=${ADMIN_FIRSTNAME:-Admin}" \
+    "ADMIN_LASTNAME=${ADMIN_LASTNAME:-User}" \
+    "TIMEZONE=${TIMEZONE}" \
+    bash -s 2>&1 <<'PROV_EOF' | tee -a "$LOG_FILE" | grep "^ADMIN_RESULT " || true
+set -Eeuo pipefail
+cd "$APP_DIR"
+log_ct() { echo "--- [ADMIN] $*" >&2; }
+fail_ct() { echo "[ADMIN] FEHLER: $*" >&2; exit 1; }
+
+AIO_CID="$(docker compose ps -q all-in-one 2>/dev/null)" || fail_ct "all-in-one Container nicht gefunden"
+[[ -n "$AIO_CID" ]] || fail_ct "all-in-one Container läuft nicht"
+# shellcheck disable=SC1091
+set -a; . ./.env; set +a
+PSQL=(docker compose exec -T -e "PGPASSWORD=${POSTGRES_PASSWORD}" postgres psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-hi-events}" -tAc)
+SQL_EMAIL="${ADMIN_EMAIL//\'/\'\'}"
+
+# --- 1) Registrieren (201) oder existierenden User übernehmen (422 = E-Mail belegt) ---
+REQ="$(mktemp)"; RESP="$(mktemp)"
+python3 - > "$REQ" <<'PYEOF'
+import json, os
+print(json.dumps({
+    "first_name": os.environ.get("ADMIN_FIRSTNAME", "Admin"),
+    "last_name": os.environ.get("ADMIN_LASTNAME", "User"),
+    "email": os.environ["ADMIN_EMAIL"],
+    "password": os.environ["ADMIN_PASSWORD"],
+    "password_confirmation": os.environ["ADMIN_PASSWORD"],
+    "timezone": os.environ.get("TIMEZONE", "Europe/Berlin"),
+}))
+PYEOF
+REG_HTTP=$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 \
+  -H 'Content-Type: application/json' -d @"$REQ" "${API_BASE}/auth/register" || echo "000")
+log_ct "POST /auth/register → HTTP ${REG_HTTP}"
+eval "$(python3 - "$RESP" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("PARSE_FAIL=1"); sys.exit(0)
+data = d.get("data") or {}
+print("ACCOUNT_ID=%s" % (data.get("id") or ""))
+PYEOF
+)"
+if [[ "${REG_HTTP}" == "201" && -n "${ACCOUNT_ID:-}" ]]; then
+  log_ct "Registrierung ok (Account ${ACCOUNT_ID})"
+  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" | tr -d '[:space:]')"
+elif [[ "${REG_HTTP}" == "422" ]] && grep -qiE 'email|taken|exists' "$RESP"; then
+  log_ct "E-Mail bereits registriert → übernehme existierenden User (Passwort wird gesetzt)"
+  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" | tr -d '[:space:]')"
+  [[ -n "$USER_ID" ]] || fail_ct "User ${ADMIN_EMAIL} in DB nicht gefunden"
+  ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" | tr -d '[:space:]')"
+  [[ -n "$ACCOUNT_ID" ]] || fail_ct "Kein Account für User ${USER_ID} gefunden"
+  BCRYPT="$(docker exec -e ADMIN_PW="$ADMIN_PASSWORD" "$AIO_CID" php -r 'echo password_hash(getenv("ADMIN_PW"), PASSWORD_BCRYPT), PHP_EOL;')"
+  [[ -n "$BCRYPT" ]] || fail_ct "bcrypt-Hash konnte nicht erzeugt werden"
+  "${PSQL[@]}" "UPDATE users SET password='${BCRYPT}', updated_at=NOW() WHERE id=${USER_ID}"
+  log_ct "Passwort für User ${USER_ID} gesetzt"
+else
+  fail_ct "Registrierung fehlgeschlagen (HTTP ${REG_HTTP}). Antwort: $(cat "$RESP")"
+fi
+[[ -n "${USER_ID:-}" && -n "${ACCOUNT_ID:-}" ]] || fail_ct "User-/Account-ID leer"
+log_ct "User-ID ${USER_ID}, Account-ID ${ACCOUNT_ID}"
+
+# --- 2) E-Mail vorab verifizieren (MAIL_MAILER=log → Link käme nie an!) ---
+if [[ "$("${PSQL[@]}" "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='email_verified_at'")" == "1" ]]; then
+  "${PSQL[@]}" "UPDATE users SET email_verified_at=NOW() WHERE email='${SQL_EMAIL}' AND email_verified_at IS NULL"
+  log_ct "E-Mail als verifiziert markiert"
+else
+  log_ct "WARNUNG: Spalte users.email_verified_at fehlt – Verifizierung übersprungen"
+fi
+
+# --- 3) SUPERADMIN-Rolle (artisan, SQL-Fallback) ---
+if printf 'yes\nyes\n' | docker exec -i "$AIO_CID" php /app/backend/artisan user:make-superadmin "$USER_ID" >&2; then
+  log_ct "SUPERADMIN via artisan vergeben"
+else
+  log_ct "artisan-Befehl fehlgeschlagen → SQL-Fallback"
+  "${PSQL[@]}" "UPDATE account_users SET role='SUPERADMIN' WHERE user_id=${USER_ID}"
+fi
+ROLE="$("${PSQL[@]}" "SELECT role FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" | tr -d '[:space:]')"
+[[ "$ROLE" == "SUPERADMIN" ]] || fail_ct "Rolle ist '${ROLE}', erwartet SUPERADMIN"
+log_ct "Rolle bestätigt: ${ROLE}"
+
+# --- 4) Login-Beweis: POST /auth/login 200 + GET /users/me 200 ---
+LREQ="$(mktemp)"; LRESP="$(mktemp)"
+python3 - > "$LREQ" <<'PYEOF'
+import json, os
+print(json.dumps({"email": os.environ["ADMIN_EMAIL"],
+  "password": os.environ["ADMIN_PASSWORD"], "account_id": int(os.environ["ACCOUNT_ID"])}))
+PYEOF
+export ACCOUNT_ID
+LOGIN_HTTP=$(curl -s -o "$LRESP" -w "%{http_code}" --max-time 30 \
+  -H 'Content-Type: application/json' -d @"$LREQ" "${API_BASE}/auth/login" || echo "000")
+TOKEN="$(python3 - "$LRESP" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(""); sys.exit(0)
+t = d.get("token") or (d.get("data") or {}).get("token") or (d.get("meta") or {}).get("token") or ""
+print(t)
+PYEOF
+)"
+[[ "${LOGIN_HTTP}" == "200" && -n "$TOKEN" ]] \
+  || fail_ct "Login-Beweis fehlgeschlagen (HTTP ${LOGIN_HTTP}). Antwort: $(cat "$LRESP")"
+ME_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+  -H "Authorization: Bearer ${TOKEN}" "${API_BASE}/users/me" || echo "000")
+[[ "${ME_HTTP}" == "200" ]] \
+  || fail_ct "GET /users/me → HTTP ${ME_HTTP} (erwartet 200, Upstream-Issue #472)"
+log_ct "Login-Beweis ok: /auth/login 200 + /users/me 200"
+
+echo "ADMIN_RESULT ok account_id=${ACCOUNT_ID} user_id=${USER_ID}"
+PROV_EOF
+  )
+  [[ "$result_line" == ADMIN_RESULT\ ok* ]] || {
+    msg_error "Admin-Provisionierung fehlgeschlagen (kein ADMIN_RESULT ok)."
+    msg_error "Diagnose: Log ${LOG_FILE} + Compose-Logs unten."
+    pct exec "$CTID" -- bash -c "cd ${APP_DIR} && docker compose logs --tail=40 --no-color" || true
+    exit 1
+  }
+  ADMIN_ACCOUNT_ID="$(echo "$result_line" | grep -oE 'account_id=[0-9]+' | cut -d= -f2)"
+  ADMIN_USER_ID="$(echo "$result_line" | grep -oE 'user_id=[0-9]+' | cut -d= -f2)"
+  msg_ok "Admin bereit: ${ADMIN_EMAIL_FINAL} (User ${ADMIN_USER_ID}, Account ${ADMIN_ACCOUNT_ID}, Rolle SUPERADMIN)"
+}
+
+# ============================================================================
 # VERIFIKATION
 # ============================================================================
 verify_install() {
@@ -530,11 +752,27 @@ verify_install() {
   onboot=$(pct config "$CTID" | grep -i onboot || echo "onboot: ?")
   log "CT-Config onboot → ${onboot}"
   msg_ok "Reboot-Sicherheit: ${onboot} + systemd enable hi-events.service"
+}
 
+print_summary() {
+  local ip="$1"
   echo ""
   echo -e "${GN} ✓ ${APP_FRIENDLY} erfolgreich installiert!${CL}"
   echo -e "  Web UI      : ${BGN}http://${ip}:${WEB_PORT}${CL}"
   echo -e "  Container-IP: ${ip}   (CT ${CTID}, hostname ${HOSTNAME_CT})"
+  if [[ -n "${ADMIN_EMAIL_FINAL:-}" ]]; then
+    echo -e "  Login (Admin): ${BGN}http://${ip}:${WEB_PORT}/auth/login${CL}"
+    echo -e "  E-Mail      : ${ADMIN_EMAIL_FINAL}"
+    echo -e "  Passwort    : ${ADMIN_PASSWORD_FINAL:-<per ENV gesetzt, siehe ADMIN_PASSWORD>}"
+    echo -e "    (Passwort steht NUR hier, nie im Log. Ändern: im Profil oder per Re-Run mit ADMIN_PASSWORD.)"
+  else
+    echo -e "  Login       : http://${ip}:${WEB_PORT}/auth/register (erst Account anlegen – Upstream hat kein Default-Login)"
+  fi
+  echo -e "  Events einrichten (Organizer-Dashboard): ${BGN}http://${ip}:${WEB_PORT}/manage/events${CL}"
+  echo -e "  Weitere User: http://${ip}:${WEB_PORT}/auth/register"
+  echo -e "    Hinweis: Bestätigungs-Mails landen im Compose-Log (MAIL_MAILER=log):"
+  echo -e "    pct exec ${CTID} -- bash -c 'cd ${APP_DIR} && docker compose logs -f all-in-one | grep -i verif'"
+  echo -e "    Für echte Mails SMTP in ${APP_DIR}/.env setzen (dann: docker compose up -d)."
   echo -e "  Service     : systemctl status hi-events.service  (im Container: pct enter ${CTID})"
   echo -e "  Verzeichnis : ${APP_DIR}  (docker-compose.yml + .env)"
   echo -e "  Update      : pct exec ${CTID} -- bash -c 'cd ${APP_DIR} && docker compose pull && docker compose up -d'"
@@ -582,6 +820,8 @@ main() {
   log "Container-IP: ${ip}"
   install_in_container "$ip"
   verify_install "$ip"
+  setup_admin "$ip"
+  print_summary "$ip"
   log "== Installation erfolgreich: http://${ip}:${WEB_PORT} =="
 }
 

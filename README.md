@@ -52,6 +52,50 @@ chmod +x /tmp/hi-events.sh
 | `POSTGRES_PASSWORD` | zufällig | DB-Passwort (bleibt bei Update erhalten) |
 | `MODE` | `lxc` | `lxc` oder `vm` |
 | `REINSTALL` | `0` | `1` = neu aufbauen |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Abfrage / generiert | Admin-Zugang (Passwort min. 8 Zeichen) |
+| `ADMIN_FIRSTNAME` / `ADMIN_LASTNAME` | `Admin` / `User` | Anzeige-Name des Admins |
+| `SKIP_ADMIN_SETUP` | `0` | `1` = kein Admin anlegen |
+
+## Anmelden & Admin-Zugang
+
+Hi.Events selbst hat **kein Standard-Login** (Upstream-Doku: erst registrieren, dann anmelden).
+Darum legt der Installer automatisch einen Admin an und fragt dabei interaktiv:
+
+```text
+Admin-E-Mail [admin@hi-events.local]: _
+Admin-Passwort (min. 8 Zeichen, leer = zufällig generieren): _
+```
+
+- **Login (Admin):** `http://<LXC-IP>:8123/auth/login` mit genau diesen Daten.
+- **Events einrichten (Organizer-Dashboard):** `http://<LXC-IP>:8123/manage/events`
+  → dort Organizer anlegen → Event + Tickets erstellen ([Erste-Schritte-Doku](https://hi.events/docs/help-center/getting-started/creating-your-first-event)).
+- Der Admin bekommt die Rolle **SUPERADMIN** (Vollzugriff, inkl. `/admin`-Bereich).
+  Der Installer beweist den Login selbst: `POST /auth/login → 200` + `GET /users/me → 200`.
+- Non-interaktiv (kein TTY): E-Mail = `admin@hi-events.local`, Passwort zufällig –
+  beides steht am Ende der Installation auf dem Terminal (nie im Log).
+- Eigene Werte ohne Abfrage:
+  ```bash
+  ADMIN_EMAIL=chef@example.com ADMIN_PASSWORD=supersecret123 \
+  bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+  ```
+- Re-Run mit existierender E-Mail übernimmt den User (Passwort wird neu gesetzt,
+  E-Mail verifiziert, Rolle sichergestellt) – idempotent, kein Datenverlust.
+- Ohne Admin installieren: `SKIP_ADMIN_SETUP=1` (dann manuell registrieren).
+
+**Weitere Benutzer:** `http://<LXC-IP>:8123/auth/register`. Hinweis: Bestätigungs-Mails
+landen im Compose-Log (`MAIL_MAILER=log`):
+```bash
+pct exec <CTID> -- bash -c 'cd /opt/hi-events && docker compose logs -f all-in-one | grep -i verif'
+```
+Für echte Mails SMTP in `/opt/hi-events/.env` eintragen, danach `docker compose up -d`.
+
+**Falls der Browser-Login trotzdem klemmt** (bekannter Upstream-Bug
+[HiEventsDev/hi.events#472](https://github.com/HiEventsDev/hi.events/issues/472):
+Login-200, danach 401): v1.1.0 setzt `APP_URL`, `SANCTUM_STATEFUL_DOMAINS=<IP>:8123`
+und `SESSION_SECURE_COOKIE=false` und lässt `SESSION_DOMAIN` bewusst leer
+(Host-only-Cookie – eine IP als Cookie-Domain lehnen Browser ab). Danach oder bei
+alten Installationen: Re-Run des Installers (zieht URLs nach) + Browser-Cookies
+für die Seite löschen.
 
 ## Was das Script tut
 
@@ -63,7 +107,11 @@ chmod +x /tmp/hi-events.sh
    `systemd/hi-events.service` (`enable`, `Restart=always`, `After=network-online.target` + `docker.service`).
 4. Öffnet Port 8123 in der Container-Firewall (iptables/ufw, falls aktiv).
 5. **Verifiziert selbst:** `systemctl is-active hi-events.service` + HTTP-Check `localhost:8123`
-   + `onboot`-Check, gibt finale URL + Container-IP aus.
+   + `onboot`-Check.
+6. **Legt den Admin an** (E-Mail/Passwort abfragen oder generieren): per API registrieren,
+   E-Mail verifizieren, `SUPERADMIN`-Rolle vergeben, **Login-Beweis**
+   (`POST /auth/login → 200` + `GET /users/me → 200`) – fängt Upstream-Bug #472 schon
+   bei der Installation ab. Gibt finale URLs + Zugangsdaten aus (Passwort nur Terminal).
 6. Bei Fehlern: **komplette Kette** (Befehl, Exit-Code, Zeile, Stacktrace via `caller`,
    40 Log-Zeilen, `pct status`, `systemctl status`, `docker ps`, Compose-Logs) + `bash -x`-Hinweis.
    Log: `/var/log/hi-events-install.log`.
@@ -91,8 +139,10 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventin
 #  ✓ Container 101 erstellt (onboot=1)
 #  ✓ Service läuft (systemctl is-active: active)
 #  ✓ Web UI antwortet (HTTP 200)
+#  ✓ Admin bereit: admin@hi-events.local (User 1, Account 1, Rolle SUPERADMIN)
 #  ✓ Hi.Events erfolgreich installiert!
 #    Web UI      : http://192.168.1.101:8123
+#    Login (Admin): http://192.168.1.101:8123/auth/login
 
 # 2. Reboot des LXC + Erreichbarkeit belegen:
 pct reboot 101
