@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.2}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.3}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -268,9 +268,9 @@ wait_container() {
     pct config "$CTID" || true
     exit 1
   fi
-  msg_info "Warte auf Container-IP (DHCP, max. 60s)"
+  msg_info "Warte auf Container-IP (DHCP, max. 120s – manche Router/FritzBox brauchen lang)"
   local cip=""
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 60); do
     cip=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)
     [[ -n "$cip" ]] && break
     sleep 2
