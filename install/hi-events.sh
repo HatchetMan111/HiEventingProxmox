@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.0}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.1}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -604,7 +604,8 @@ log_ct() { echo "--- [ADMIN] $*" >&2; }
 fail_ct() { echo "[ADMIN] FEHLER: $*" >&2; exit 1; }
 
 AIO_CID="$(docker compose ps -q all-in-one 2>/dev/null)" || fail_ct "all-in-one Container nicht gefunden"
-[[ -n "$AIO_CID" ]] || fail_ct "all-in-one Container läuft nicht"
+[[ -n "$AIO_CID" ]] || fail_ct "all-in-one Container läuft nicht (docker compose ps -q leer)"
+log_ct "Compose-Projektstatus:"; docker compose ps >&2 || true
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
 PSQL=(docker compose exec -T -e "PGPASSWORD=${POSTGRES_PASSWORD}" postgres psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-hi-events}" -tAc)
@@ -626,24 +627,25 @@ PYEOF
 REG_HTTP=$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 \
   -H 'Content-Type: application/json' -d @"$REQ" "${API_BASE}/auth/register" || echo "000")
 log_ct "POST /auth/register → HTTP ${REG_HTTP}"
-eval "$(python3 - "$RESP" <<'PYEOF'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    print("PARSE_FAIL=1"); sys.exit(0)
-data = d.get("data") or {}
-print("ACCOUNT_ID=%s" % (data.get("id") or ""))
-PYEOF
-)"
-if [[ "${REG_HTTP}" == "201" && -n "${ACCOUNT_ID:-}" ]]; then
-  log_ct "Registrierung ok (Account ${ACCOUNT_ID})"
-  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" | tr -d '[:space:]')"
+# IDs grundsätzlich aus der DB lesen (robust gegen Antwort-Formatänderungen):
+lookup_ids() {
+  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+  if [[ -n "$USER_ID" ]]; then
+    ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+  else
+    ACCOUNT_ID=""
+  fi
+}
+if [[ "${REG_HTTP}" == "201" ]]; then
+  lookup_ids
+  [[ -n "${USER_ID:-}" && -n "${ACCOUNT_ID:-}" ]] \
+    || fail_ct "Registrierung meldet 201, aber User/Account fehlen in DB. Antwort: $(head -c 500 "$RESP")"
+  log_ct "Registrierung ok (User ${USER_ID}, Account ${ACCOUNT_ID})"
 elif [[ "${REG_HTTP}" == "422" ]] && grep -qiE 'email|taken|exists' "$RESP"; then
   log_ct "E-Mail bereits registriert → übernehme existierenden User (Passwort wird gesetzt)"
-  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" | tr -d '[:space:]')"
-  [[ -n "$USER_ID" ]] || fail_ct "User ${ADMIN_EMAIL} in DB nicht gefunden"
-  ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" | tr -d '[:space:]')"
+  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+  [[ -n "$USER_ID" ]] || fail_ct "User ${ADMIN_EMAIL} in DB nicht gefunden (psql-Login prüfen)"
+  ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
   [[ -n "$ACCOUNT_ID" ]] || fail_ct "Kein Account für User ${USER_ID} gefunden"
   BCRYPT="$(docker exec -e ADMIN_PW="$ADMIN_PASSWORD" "$AIO_CID" php -r 'echo password_hash(getenv("ADMIN_PW"), PASSWORD_BCRYPT), PHP_EOL;')"
   [[ -n "$BCRYPT" ]] || fail_ct "bcrypt-Hash konnte nicht erzeugt werden"
@@ -690,12 +692,28 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     print(""); sys.exit(0)
-t = d.get("token") or (d.get("data") or {}).get("token") or (d.get("meta") or {}).get("token") or ""
-print(t)
+def deep(o):
+    if isinstance(o, dict):
+        for k in ("token", "access_token", "accessToken"):
+            if o.get(k):
+                return o[k]
+        for v in o.values():
+            r = deep(v)
+            if r:
+                return r
+    if isinstance(o, list):
+        for v in o:
+            r = deep(v)
+            if r:
+                return r
+    return ""
+print(deep(d))
 PYEOF
 )"
-[[ "${LOGIN_HTTP}" == "200" && -n "$TOKEN" ]] \
-  || fail_ct "Login-Beweis fehlgeschlagen (HTTP ${LOGIN_HTTP}). Antwort: $(cat "$LRESP")"
+if [[ "${LOGIN_HTTP}" != "200" || -z "$TOKEN" ]]; then
+  KEYS="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(list(d.keys()) if isinstance(d,dict) else type(d).__name__)' "$LRESP" 2>/dev/null || echo '?')"
+  fail_ct "Login-Beweis fehlgeschlagen (HTTP ${LOGIN_HTTP}). Top-Level-Keys: ${KEYS}. Anfang der Antwort: $(head -c 300 "$LRESP")"
+fi
 ME_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   -H "Authorization: Bearer ${TOKEN}" "${API_BASE}/users/me" || echo "000")
 [[ "${ME_HTTP}" == "200" ]] \
@@ -707,8 +725,13 @@ PROV_EOF
   )
   [[ "$result_line" == ADMIN_RESULT\ ok* ]] || {
     msg_error "Admin-Provisionierung fehlgeschlagen (kein ADMIN_RESULT ok)."
-    msg_error "Diagnose: Log ${LOG_FILE} + Compose-Logs unten."
-    pct exec "$CTID" -- bash -c "cd ${APP_DIR} && docker compose logs --tail=40 --no-color" || true
+    echo -e "${YW}--- Letzte [ADMIN]-Schritte aus ${LOG_FILE} ---${CL}" >&2
+    grep -a "ADMIN" "$LOG_FILE" 2>/dev/null | tail -n 25 >&2 || true
+    echo -e "${YW}--- Compose-Projektstatus ---${CL}" >&2
+    pct exec "$CTID" -- bash -c "cd ${APP_DIR} && docker compose ps" 2>&1 | tee -a "$LOG_FILE" >&2 || true
+    echo -e "${YW}--- Compose-Logs (gefiltert, letzte 25) ---${CL}" >&2
+    pct exec "$CTID" -- bash -c "cd ${APP_DIR} && docker compose logs --tail=60 --no-color 2>/dev/null | grep -av 'box-sizing\|style=' | tail -n 25" 2>&1 | tee -a "$LOG_FILE" >&2 || true
+    msg_error "Vollständig: ${LOG_FILE} – Re-Run idempotent möglich."
     exit 1
   }
   ADMIN_ACCOUNT_ID="$(echo "$result_line" | grep -oE 'account_id=[0-9]+' | cut -d= -f2)"
