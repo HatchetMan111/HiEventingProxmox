@@ -2,7 +2,12 @@
 
 > **Installation auf dem Proxmox-Host als root:**
 > ```bash
-> bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+> bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+> ```
+> Hängt der Download (IPv6/DS-Lite? GitHub-Route?), alternativ:
+> ```bash
+> curl -4 -fsSL --connect-timeout 10 --max-time 60 -o /tmp/hi-events.sh \
+>   https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh && bash /tmp/hi-events.sh
 > ```
 > Install-Script: [`install/hi-events.sh`](install/hi-events.sh) · systemd-Unit: [`systemd/hi-events.service`](systemd/hi-events.service)
 
@@ -19,20 +24,20 @@ Läuft **vollständig lokal**, keine Cloud nötig.
 ## Einzeiler (auf dem Proxmox-Host als root)
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
 ```
 
 Mit eigener CT-ID / Ressourcen:
 
 ```bash
 CTID=101 VAR_CPU=2 VAR_RAM=4096 VAR_DISK=12 \
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
 ```
 
 Alle Optionen:
 
 ```bash
-wget -qO /tmp/hi-events.sh https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh
+wget -4 -qO /tmp/hi-events.sh --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh
 chmod +x /tmp/hi-events.sh
 /tmp/hi-events.sh --help
 # /tmp/hi-events.sh --ctid 101 --cpu 2 --ram 4096 --disk 12 --storage local-lvm --bridge vmbr0 --ip dhcp
@@ -85,7 +90,7 @@ Admin-Passwort [Enter = Standard: HiEvents-Admin-123]: _
 - Eigene Werte ohne Abfrage:
   ```bash
   ADMIN_EMAIL=chef@example.com ADMIN_PASSWORD=supersecret123 \
-  bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+  bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
   ```
 - Re-Run mit existierender E-Mail übernimmt den User (Passwort wird neu gesetzt,
   E-Mail verifiziert, Rolle sichergestellt) – idempotent, kein Datenverlust.
@@ -132,7 +137,7 @@ für die Seite löschen.
 pct exec <CTID> -- bash -c 'cd /opt/hi-events && docker compose pull && docker compose up -d'
 
 # Re-Run des Installers (idempotent, kein Datenverlust):
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
 
 # Deinstall (Container + Daten weg):
 CTID=<CTID> bash /tmp/hi-events.sh --uninstall
@@ -143,7 +148,7 @@ CTID=<CTID> bash /tmp/hi-events.sh --uninstall
 
 ```bash
 # 1. Installieren (auf dem PVE-Host):
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
 # Erwartet u. a.:
 #  ✓ Container 101 erstellt (onboot=1)
 #  ✓ Service läuft (systemctl is-active: active)

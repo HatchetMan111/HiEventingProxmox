@@ -8,7 +8,7 @@
 # Web UI:  http://<LXC-IP>:8123
 # Stil:    Proxmox VE Community Scripts (community-scripts.github.io/ProxmoxVE)
 # Host:    Auf dem Proxmox-Host als root ausführen:
-#          bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+#          bash -c "$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
 #
 # -E ist Pflicht: ohne -E wird der ERR-Trap NICHT in Funktionen/Subshells vererbt
 # (Folge: stiller Abbruch ohne Fehlerkette). Siehe Regressionstest mit Mock-pct.
@@ -83,7 +83,7 @@ usage() {
 ${APP_FRIENDLY} Proxmox Installer (Community-Scripts-Stil)
 
 Verwendung:
-  bash -c "\$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
+  bash -c "\$(wget -4 -qO - --timeout=30 https://raw.githubusercontent.com/HatchetMan111/HiEventingProxmox/main/install/hi-events.sh)"
   # oder lokal:
   CTID=101 ./install/hi-events.sh [--ctid 101] [--cpu 2] [--ram 4096] [--disk 12]
                                   [--storage local-lvm] [--bridge vmbr0] [--ip dhcp]
