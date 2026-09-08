@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.0}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.1}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -457,10 +457,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    entrypoint: ["/app/patches/entrypoint.sh"]
     volumes:
-      # Login-Cookie-Patch: secure/sameSite ist in BaseAuthAction hartkodiert
-      # (secure:true + sameSite:None -> Browser verwirft Cookie ueber http://,
-      #  Upstream-Issue #472). Patch wird beim Start eingeschleust (s.u.).
+      # Login-Cookie-Patch: BaseAuthAction kodiert secure:true/sameSite:None hart
+      # (Upstream-Issue #472). Entry-Point-Wrapper wendet den Patch bei JEDEM
+      # Container-Start an (auch nach down/up, pull, Reboot) und exec't /startup.sh.
       - ./patches:/app/patches:ro
   redis:
     image: redis:7-alpine
@@ -524,10 +525,12 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: a
   ufw allow ${WEB_PORT}/tcp || true
 fi
 echo "--- [CT] Starte hi-events.service ---"
-# --- Login-Cookie-Patch (Upstream-Issue #472, Browsertest-Beweis siehe verify) ---
+# --- Login-Cookie-Patch (Upstream-Issue #472) ---
 # BaseAuthAction::getAuthCookie() kodiert hart: secure=true + sameSite=None.
 # Ueber http://IP:8123 verwirft jeder Browser diesen Cookie -> Token weg nach 1s
 # -> Rueckfall zum Login. Kein ENV erreicht diese Stelle -> Laufzeit-Patch.
+# entrypoint.sh ummantelt /startup.sh: Patch bei JEDEM Container-Start (idempotent)
+# + Warmup-Warten auf die API, damit Provision/Cookie-Check nie ins Leere laufen.
 mkdir -p "$APP_DIR/patches"
 cat > "$APP_DIR/patches/login-cookie.patch" <<'PATCH_EOF'
 --- a/app/Http/Actions/Auth/BaseAuthAction.php
@@ -545,40 +548,58 @@ cat > "$APP_DIR/patches/login-cookie.patch" <<'PATCH_EOF'
          );
      }
 PATCH_EOF
-cat > "$APP_DIR/patches/apply-cookie-patch.sh" <<'APPLYPATCH_EOF'
-#!/bin/bash
-# Wird beim Container-Start ausgefuehrt (entrypoint-Hook), idempotent.
-set -euo pipefail
+cat > "$APP_DIR/patches/entrypoint.sh" <<'ENTRY_EOF'
+#!/bin/sh
+# Entry-Point-Wrapper (ersetzt /startup.sh als PID 1-Aufgabe):
+# 1) Login-Cookie-Patch anwenden (idempotent), 2) Original-Startup exec'en.
+set -e
 TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
-PATCH=/app/patches/login-cookie.patch
 if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
-  cd /app/backend
-  if patch --dry-run "$TARGET" "$PATCH" >/dev/null 2>&1; then
-    patch "$TARGET" "$PATCH" && echo "[cookie-patch] angewendet" \
-      || { echo "[cookie-patch] FEHLGESCHLAGEN" >&2; exit 0; }
-  else
-    # Kontextzeilen weichen ab -> gezielter sed-Fallback (robust gegen Formatierung)
-    sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
-    sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
-    grep -q "sameSite: 'Lax'" "$TARGET" && echo "[cookie-patch] via sed gesetzt" \
-      || echo "[cookie-patch] WARNUNG: Muster nicht gefunden" >&2
-  fi
+  sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
+  sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
+  grep -q "sameSite: 'Lax'" "$TARGET" \
+    && echo "[cookie-patch] angewendet (secure=ENV-gesteuert, sameSite=Lax)" \
+    || echo "[cookie-patch] WARNUNG: Muster nicht gefunden" >&2
 else
   echo "[cookie-patch] bereits aktiv"
 fi
-php artisan config:clear >/dev/null 2>&1 || true
-APPLYPATCH_EOF
-chmod +x "$APP_DIR/patches/apply-cookie-patch.sh"
-# Patch in Container anwenden + OpCache leeren (einmalig; Reboot-sicher via Service-Restart)
-AIO_ID="$(docker compose ps -q all-in-one </dev/null)"
-if [[ -n "$AIO_ID" ]]; then
-  docker compose exec -T all-in-one /app/patches/apply-cookie-patch.sh </dev/null \
-    || echo "[cookie-patch] Container-Exec fehlgeschlagen (pruefen!)" >&2
-  docker compose restart all-in-one </dev/null >/dev/null 2>&1 || true
-  sleep 8
+exec /startup.sh
+ENTRY_EOF
+cat > "$APP_DIR/patches/apply-cookie-patch.sh" <<'APPLYPATCH_EOF'
+#!/bin/bash
+# manueller Fallback: Patch nachtraeglich in laufendem Container anwenden.
+set -euo pipefail
+TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
+if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
+  sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
+  sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
+  grep -q "sameSite: 'Lax'" "$TARGET" && echo "[cookie-patch] via sed gesetzt" \
+    || { echo "[cookie-patch] FEHLER: Muster nicht gefunden" >&2; exit 1; }
+else
+  echo "[cookie-patch] bereits aktiv"
 fi
+APPLYPATCH_EOF
+chmod +x "$APP_DIR/patches/entrypoint.sh" "$APP_DIR/patches/apply-cookie-patch.sh"
+
+# Stack hochfahren. WICHTIG: 'up -d' NICHT 'up' (foreground) — service-Unit
+# startet 'up' (attach), hier fuer Setup einmal detachted + auf Health warten.
+docker compose up -d --wait </dev/null 2>&1 | tail -n 5
+# --wait wartet auf healthy; fallback-schleife (aeltere compose):
+for i in $(seq 1 60); do
+  AIO_STATE="$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q all-in-one </dev/null)" 2>/dev/null || echo '?')"
+  [[ "$AIO_STATE" == "healthy" ]] && break
+  sleep 5
+done
+echo "all-in-one Health: ${AIO_STATE:-unbekannt}"
 
 systemctl restart hi-events.service || (journalctl -u hi-events.service --no-pager -n 50; exit 1)
+# Nach Service-Restart (compose down + up) erneut auf API-Bereitschaft warten:
+for i in $(seq 1 60); do
+  HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:${WEB_PORT}/api/auth/login 2>/dev/null || echo 000)"
+  [[ "$HTTP_CODE" =~ ^(200|405|400|422|404)$ ]] && break
+  sleep 5
+done
+echo "API nach Restart: HTTP ${HTTP_CODE:-000}"
 IN_CT_EOF
 
   msg_ok "In-Container-Setup abgeschlossen"
@@ -693,8 +714,24 @@ cd "$APP_DIR"
 log_ct() { echo "--- [ADMIN] $*" >&2; }
 fail_ct() { echo "[ADMIN] FEHLER: $*" >&2; exit 1; }
 
-AIO_CID="$(docker compose ps -q all-in-one </dev/null 2>/dev/null)" || fail_ct "all-in-one Container nicht gefunden"
-[[ -n "$AIO_CID" ]] || fail_ct "all-in-one Container läuft nicht (docker compose ps -q leer)"
+# --- 0) Auf App-Bereitschaft warten (Race-Condition-Guard, max. 180s) ---
+# 'docker compose ps -q' ist direkt nach Stack-Start leer; die API braucht
+# Sekunden bis Minuten (Migrations). Erst warten, DANN die Checks machen.
+log_ct "Warte auf all-in-one (healthy) + API-Bereitschaft..."
+for i in $(seq 1 36); do
+  AIO_CID_TRY="$(docker compose ps -q all-in-one </dev/null 2>/dev/null || true)"
+  if [[ -n "$AIO_CID_TRY" ]]; then
+    H="$(docker inspect -f '{{.State.Health.Status}}' "$AIO_CID_TRY" 2>/dev/null || echo '?')"
+    API="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:${WEB_PORT}/api/auth/login 2>/dev/null || echo 000)"
+    if [[ "$H" == "healthy" && "$API" =~ ^(200|405|400|422|404)$ ]]; then
+      log_ct "App bereit (Versuch ${i}: health=${H}, API=${API})"
+      break
+    fi
+  fi
+  sleep 5
+done
+[[ -n "$AIO_CID_TRY" ]] || fail_ct "all-in-one auch nach 180s nicht in 'docker compose ps' – Stack prüfen: docker compose ps && docker compose logs --tail=30"
+AIO_CID="$AIO_CID_TRY"
 log_ct "Compose-Projektstatus:"; docker compose ps </dev/null >&2 || true
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
