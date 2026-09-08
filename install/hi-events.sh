@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.3}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.4}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -612,9 +612,12 @@ setup_admin() {
   msg_info "Lege Admin-Account an (${ADMIN_EMAIL_FINAL}) + Login-Beweis via API"
 
   local result_line
-  # NUR die ADMIN_RESULT-Zeile steht auf stdout (grep = Fail-Fast-Assertion);
-  # Fortschritt läuft über stderr+Log. Das Passwort erscheint nirgends.
-  result_line=$(pct exec "$CTID" -- env \
+  # Fortschritt läuft über stderr+Log+Terminal (Passwort nirgends).
+  # Ergebnis via DATEI lesen (robust gegen Pipe-Abbrüche) + Exit via prov_rc.
+  # Vorher alte Ergebnisdatei löschen (kein False-Positive vom Vorlauf).
+  pct exec "$CTID" -- rm -f "${APP_DIR}/.admin-result" 2>/dev/null || true
+  local prov_rc=0
+  pct exec "$CTID" -- env \
     "APP_DIR=${APP_DIR}" \
     "WEB_PORT=${WEB_PORT}" \
     "API_BASE=http://localhost:${WEB_PORT}/api" \
@@ -623,8 +626,11 @@ setup_admin() {
     "ADMIN_FIRSTNAME=${ADMIN_FIRSTNAME:-Admin}" \
     "ADMIN_LASTNAME=${ADMIN_LASTNAME:-User}" \
     "TIMEZONE=${TIMEZONE}" \
-    bash -s 2>&1 <<'PROV_EOF' | tee -a "$LOG_FILE" | grep "^ADMIN_RESULT " || true
+    bash -s 2>&1 <<'PROV_EOF' | tee -a "$LOG_FILE" || prov_rc=$?
 set -Eeuo pipefail
+# ERR-Falle IM Container: meldet jede stille set -e-Beendigung mit Zeilennummer.
+# (Ohne das rät man bei Abbrüchen ohne [ADMIN] FEHLER-Zeile im Dunkeln.)
+trap 'echo "[ADMIN] ABBRUCH in Payload-Zeile ${LINENO} (Befehl: ${BASH_COMMAND})" >&2' ERR
 cd "$APP_DIR"
 log_ct() { echo "--- [ADMIN] $*" >&2; }
 fail_ct() { echo "[ADMIN] FEHLER: $*" >&2; exit 1; }
@@ -682,6 +688,7 @@ else
 fi
 [[ -n "${USER_ID:-}" && -n "${ACCOUNT_ID:-}" ]] || fail_ct "User-/Account-ID leer"
 log_ct "User-ID ${USER_ID}, Account-ID ${ACCOUNT_ID}"
+export ACCOUNT_ID   # MUSS vor dem Login-Python exportiert sein (os.environ)!
 
 # --- 2) E-Mail vorab verifizieren (MAIL_MAILER=log → Link käme nie an!) ---
 if [[ "$("${PSQL[@]}" "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='email_verified_at'")" == "1" ]]; then
@@ -709,7 +716,6 @@ import json, os
 print(json.dumps({"email": os.environ["ADMIN_EMAIL"],
   "password": os.environ["ADMIN_PASSWORD"], "account_id": int(os.environ["ACCOUNT_ID"])}))
 PYEOF
-export ACCOUNT_ID
 LOGIN_HTTP=$(curl -s -o "$LRESP" -w "%{http_code}" --max-time 30 \
   -H 'Content-Type: application/json' -d @"$LREQ" "${API_BASE}/auth/login" || echo "000")
 TOKEN="$(python3 - "$LRESP" <<'PYEOF'
@@ -746,20 +752,26 @@ ME_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   || fail_ct "GET /users/me → HTTP ${ME_HTTP} (erwartet 200, Upstream-Issue #472)"
 log_ct "Login-Beweis ok: /auth/login 200 + /users/me 200"
 
-echo "ADMIN_RESULT ok account_id=${ACCOUNT_ID} user_id=${USER_ID}"
+# Ergebnis doppelt sichern: stdout (Log) + Datei (robust gegen Pipe-Abbrüche).
+echo "ADMIN_RESULT ok account_id=${ACCOUNT_ID} user_id=${USER_ID}" | tee "${APP_DIR}/.admin-result"
 PROV_EOF
-  )
-  [[ "$result_line" == ADMIN_RESULT\ ok* ]] || {
-    msg_error "Admin-Provisionierung fehlgeschlagen (kein ADMIN_RESULT ok)."
+  log "Provision-Exit (pct-Seite): ${prov_rc}"
+  result_line=$(pct exec "$CTID" -- cat "${APP_DIR}/.admin-result" 2>/dev/null || true)
+  if [[ "$prov_rc" -ne 0 || "$result_line" != ADMIN_RESULT\ ok* ]]; then
+    msg_error "Admin-Provisionierung fehlgeschlagen (pct-Exit ${prov_rc}, Ergebnis: '${result_line:-<leer>}')."
     echo -e "${YW}--- Letzte [ADMIN]-Schritte aus ${LOG_FILE} ---${CL}" >&2
     grep -a "ADMIN" "$LOG_FILE" 2>/dev/null | tail -n 25 >&2 || true
+    echo -e "${YW}--- Log-Schwanz (letzte 15 Zeilen, ungefiltert – hier steht auch Verstecktes) ---${CL}" >&2
+    tail -n 15 "$LOG_FILE" 2>/dev/null >&2 || true
+    echo -e "${YW}--- OOM-Killer? (Host-dmesg) ---${CL}" >&2
+    dmesg 2>/dev/null | grep -aiE 'oom|killed process' | tail -n 5 >&2 || true
     echo -e "${YW}--- Compose-Projektstatus ---${CL}" >&2
     pct exec "$CTID" -- bash -c "cd ${APP_DIR} && docker compose ps" 2>&1 | tee -a "$LOG_FILE" >&2 || true
     echo -e "${YW}--- Compose-Logs (gefiltert, letzte 25) ---${CL}" >&2
     pct exec "$CTID" -- bash -c "cd ${APP_DIR} && docker compose logs --tail=60 --no-color 2>/dev/null | grep -av 'box-sizing\|style=' | tail -n 25" 2>&1 | tee -a "$LOG_FILE" >&2 || true
     msg_error "Vollständig: ${LOG_FILE} – Re-Run idempotent möglich."
     exit 1
-  }
+  fi
   ADMIN_ACCOUNT_ID="$(echo "$result_line" | grep -oE 'account_id=[0-9]+' | cut -d= -f2)"
   ADMIN_USER_ID="$(echo "$result_line" | grep -oE 'user_id=[0-9]+' | cut -d= -f2)"
   msg_ok "Admin bereit: ${ADMIN_EMAIL_FINAL} (User ${ADMIN_USER_ID}, Account ${ADMIN_ACCOUNT_ID}, Rolle SUPERADMIN)"
