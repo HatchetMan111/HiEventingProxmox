@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.4}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.5}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -50,6 +50,8 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"               # leer = abfragen/generieren 
 ADMIN_FIRSTNAME="${ADMIN_FIRSTNAME:-Admin}"
 ADMIN_LASTNAME="${ADMIN_LASTNAME:-User}"
 ADMIN_DEFAULT_EMAIL="${ADMIN_DEFAULT_EMAIL:-admin@hi-events.local}"
+# Standard-Login (öffentlich dokumentiert, bitte nach erstem Login in der UI ändern!):
+ADMIN_DEFAULT_PASSWORD="${ADMIN_DEFAULT_PASSWORD:-HiEvents-Admin-123}"
 SKIP_ADMIN_SETUP="${SKIP_ADMIN_SETUP:-0}"          # 1 = kein Admin anlegen (nur Stack installieren)
 REINSTALL="${REINSTALL:-0}"                        # 1 = Container bei Existenz neu erstellen (DATENVERLUST)
 MODE="${MODE:-lxc}"                                # "lxc" (Standard) oder "vm" (leistungshungrig / kein nesting)
@@ -584,19 +586,16 @@ prompt_admin_credentials() {
     if [[ -t 0 ]]; then
       local _pw=""
       while true; do
-        read -r -s -p "Admin-Passwort (min. 8 Zeichen, leer = zufällig generieren): " _pw < /dev/tty || true
+        # Standard-Login: einfach Enter drücken (später in der UI änderbar).
+        read -r -s -p "Admin-Passwort [Enter = Standard: ${ADMIN_DEFAULT_PASSWORD}]: " _pw < /dev/tty || true
         echo >&2
-        if [[ -z "$_pw" ]]; then
-          ADMIN_PASSWORD_FINAL="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
-          log "Admin-Passwort zufällig generiert (Anzeige am Ende, NICHT im Log)."
-          break
-        fi
+        [[ -z "$_pw" ]] && _pw="$ADMIN_DEFAULT_PASSWORD"
         if [[ "${#_pw}" -ge 8 ]]; then ADMIN_PASSWORD_FINAL="$_pw"; break; fi
         msg_error "Zu kurz (Hi.Events-Policy: min. 8 Zeichen). Nochmal."
       done
     else
-      ADMIN_PASSWORD_FINAL="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
-      log "Kein TTY → Admin-Passwort generiert (Anzeige am Ende, NICHT im Log)."
+      ADMIN_PASSWORD_FINAL="$ADMIN_DEFAULT_PASSWORD"
+      log "Kein TTY → Standard-Passwort (bitte nach Login in der UI ändern)."
     fi
   else
     [[ "${#ADMIN_PASSWORD}" -ge 8 ]] || { msg_error "ADMIN_PASSWORD zu kurz (min. 8 Zeichen)."; exit 1; }
@@ -635,9 +634,9 @@ cd "$APP_DIR"
 log_ct() { echo "--- [ADMIN] $*" >&2; }
 fail_ct() { echo "[ADMIN] FEHLER: $*" >&2; exit 1; }
 
-AIO_CID="$(docker compose ps -q all-in-one 2>/dev/null)" || fail_ct "all-in-one Container nicht gefunden"
+AIO_CID="$(docker compose ps -q all-in-one </dev/null 2>/dev/null)" || fail_ct "all-in-one Container nicht gefunden"
 [[ -n "$AIO_CID" ]] || fail_ct "all-in-one Container läuft nicht (docker compose ps -q leer)"
-log_ct "Compose-Projektstatus:"; docker compose ps >&2 || true
+log_ct "Compose-Projektstatus:"; docker compose ps </dev/null >&2 || true
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
 PSQL=(docker compose exec -T -e "PGPASSWORD=${POSTGRES_PASSWORD}" postgres psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-hi-events}" -tAc)
@@ -661,9 +660,9 @@ REG_HTTP=$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 \
 log_ct "POST /auth/register → HTTP ${REG_HTTP}"
 # IDs grundsätzlich aus der DB lesen (robust gegen Antwort-Formatänderungen):
 lookup_ids() {
-  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" </dev/null 2>/dev/null | tr -d '[:space:]')" || true
   if [[ -n "$USER_ID" ]]; then
-    ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+    ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" </dev/null 2>/dev/null | tr -d '[:space:]')" || true
   else
     ACCOUNT_ID=""
   fi
@@ -675,13 +674,13 @@ if [[ "${REG_HTTP}" == "201" ]]; then
   log_ct "Registrierung ok (User ${USER_ID}, Account ${ACCOUNT_ID})"
 elif [[ "${REG_HTTP}" == "422" ]] && grep -qiE 'email|taken|exists' "$RESP"; then
   log_ct "E-Mail bereits registriert → übernehme existierenden User (Passwort wird gesetzt)"
-  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+  USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" </dev/null 2>/dev/null | tr -d '[:space:]')" || true
   [[ -n "$USER_ID" ]] || fail_ct "User ${ADMIN_EMAIL} in DB nicht gefunden (psql-Login prüfen)"
-  ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" 2>/dev/null | tr -d '[:space:]')" || true
+  ACCOUNT_ID="$("${PSQL[@]}" "SELECT account_id FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" </dev/null 2>/dev/null | tr -d '[:space:]')" || true
   [[ -n "$ACCOUNT_ID" ]] || fail_ct "Kein Account für User ${USER_ID} gefunden"
-  BCRYPT="$(docker exec -e ADMIN_PW="$ADMIN_PASSWORD" "$AIO_CID" php -r 'echo password_hash(getenv("ADMIN_PW"), PASSWORD_BCRYPT), PHP_EOL;')"
+  BCRYPT="$(docker exec -e ADMIN_PW="$ADMIN_PASSWORD" "$AIO_CID" php -r 'echo password_hash(getenv("ADMIN_PW"), PASSWORD_BCRYPT), PHP_EOL;' </dev/null)"
   [[ -n "$BCRYPT" ]] || fail_ct "bcrypt-Hash konnte nicht erzeugt werden"
-  "${PSQL[@]}" "UPDATE users SET password='${BCRYPT}', updated_at=NOW() WHERE id=${USER_ID}"
+  "${PSQL[@]}" "UPDATE users SET password='${BCRYPT}', updated_at=NOW() WHERE id=${USER_ID}" </dev/null
   log_ct "Passwort für User ${USER_ID} gesetzt"
 else
   fail_ct "Registrierung fehlgeschlagen (HTTP ${REG_HTTP}). Antwort: $(cat "$RESP")"
@@ -691,8 +690,8 @@ log_ct "User-ID ${USER_ID}, Account-ID ${ACCOUNT_ID}"
 export ACCOUNT_ID   # MUSS vor dem Login-Python exportiert sein (os.environ)!
 
 # --- 2) E-Mail vorab verifizieren (MAIL_MAILER=log → Link käme nie an!) ---
-if [[ "$("${PSQL[@]}" "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='email_verified_at'")" == "1" ]]; then
-  "${PSQL[@]}" "UPDATE users SET email_verified_at=NOW() WHERE email='${SQL_EMAIL}' AND email_verified_at IS NULL"
+if [[ "$("${PSQL[@]}" "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='email_verified_at'" </dev/null)" == "1" ]]; then
+  "${PSQL[@]}" "UPDATE users SET email_verified_at=NOW() WHERE email='${SQL_EMAIL}' AND email_verified_at IS NULL" </dev/null
   log_ct "E-Mail als verifiziert markiert"
 else
   log_ct "WARNUNG: Spalte users.email_verified_at fehlt – Verifizierung übersprungen"
@@ -703,9 +702,9 @@ if printf 'yes\nyes\n' | docker exec -i "$AIO_CID" php /app/backend/artisan user
   log_ct "SUPERADMIN via artisan vergeben"
 else
   log_ct "artisan-Befehl fehlgeschlagen → SQL-Fallback"
-  "${PSQL[@]}" "UPDATE account_users SET role='SUPERADMIN' WHERE user_id=${USER_ID}"
+  "${PSQL[@]}" "UPDATE account_users SET role='SUPERADMIN' WHERE user_id=${USER_ID}" </dev/null
 fi
-ROLE="$("${PSQL[@]}" "SELECT role FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" | tr -d '[:space:]')"
+ROLE="$("${PSQL[@]}" "SELECT role FROM account_users WHERE user_id=${USER_ID} ORDER BY id LIMIT 1" </dev/null | tr -d '[:space:]')"
 [[ "$ROLE" == "SUPERADMIN" ]] || fail_ct "Rolle ist '${ROLE}', erwartet SUPERADMIN"
 log_ct "Rolle bestätigt: ${ROLE}"
 

@@ -52,7 +52,8 @@ chmod +x /tmp/hi-events.sh
 | `POSTGRES_PASSWORD` | zufällig | DB-Passwort (bleibt bei Update erhalten) |
 | `MODE` | `lxc` | `lxc` oder `vm` |
 | `REINSTALL` | `0` | `1` = neu aufbauen |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Abfrage / generiert | Admin-Zugang (Passwort min. 8 Zeichen) |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Abfrage / Standard | Admin-Zugang (Passwort min. 8 Zeichen) |
+| `ADMIN_DEFAULT_PASSWORD` | `HiEvents-Admin-123` | Standard-Passwort bei Enter/no-TTY |
 | `ADMIN_FIRSTNAME` / `ADMIN_LASTNAME` | `Admin` / `User` | Anzeige-Name des Admins |
 | `SKIP_ADMIN_SETUP` | `0` | `1` = kein Admin anlegen |
 
@@ -63,17 +64,23 @@ Darum legt der Installer automatisch einen Admin an und fragt dabei interaktiv:
 
 ```text
 Admin-E-Mail [admin@hi-events.local]: _
-Admin-Passwort (min. 8 Zeichen, leer = zufällig generieren): _
+Admin-Passwort [Enter = Standard: HiEvents-Admin-123]: _
 ```
+
+- **Standard-Login (einfach 2× Enter):** E-Mail `admin@hi-events.local`,
+  Passwort `HiEvents-Admin-123` – bitte nach erstem Login in der UI ändern
+  (Profil → Passwort). Eigene Werte per `ADMIN_EMAIL`/`ADMIN_PASSWORD`
+  (oder `ADMIN_DEFAULT_PASSWORD`) vorbelegbar.
 
 - **Login (Admin):** `http://<LXC-IP>:8123/auth/login` mit genau diesen Daten.
 - **Events einrichten (Organizer-Dashboard):** `http://<LXC-IP>:8123/manage/events`
   → dort Organizer anlegen → Event + Tickets erstellen ([Erste-Schritte-Doku](https://hi.events/docs/help-center/getting-started/creating-your-first-event)).
 - Der Admin bekommt die Rolle **SUPERADMIN** (Vollzugriff, inkl. `/admin`-Bereich).
   Der Installer beweist den Login selbst: `POST /auth/login → 200` + `GET /users/me → 200`.
-- Non-interaktiv (kein TTY): E-Mail = `admin@hi-events.local`, Passwort zufällig –
-  beides steht am Ende der Installation als **ZUGANGSDATEN-Block** auf dem Terminal
-  und zusätzlich in `~/hi-events-ct<CTID>.creds` auf dem Proxmox-Host (nur root lesbar).
+- Non-interaktiv (kein TTY): Standard-Login `admin@hi-events.local` /
+  `HiEvents-Admin-123` – beides steht am Ende der Installation als
+  **ZUGANGSDATEN-Block** auf dem Terminal und zusätzlich in
+  `~/hi-events-ct<CTID>.creds` auf dem Proxmox-Host (nur root lesbar).
   Weder Block noch Datei landen im Install-Log.
 - Eigene Werte ohne Abfrage:
   ```bash
