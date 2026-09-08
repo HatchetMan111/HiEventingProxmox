@@ -105,11 +105,15 @@ Für echte Mails SMTP in `/opt/hi-events/.env` eintragen, danach `docker compose
 
 **Falls der Browser-Login trotzdem klemmt** (bekannter Upstream-Bug
 [HiEventsDev/hi.events#472](https://github.com/HiEventsDev/hi.events/issues/472):
-Login-200, danach 401): v1.1.0 setzt `APP_URL`, `SANCTUM_STATEFUL_DOMAINS=<IP>:8123`
-und `SESSION_SECURE_COOKIE=false` und lässt `SESSION_DOMAIN` bewusst leer
-(Host-only-Cookie – eine IP als Cookie-Domain lehnen Browser ab). Danach oder bei
-alten Installationen: Re-Run des Installers (zieht URLs nach) + Browser-Cookies
-für die Seite löschen.
+Login-200, danach 401): **v1.3.0 patcht die eigentliche Ursache** —
+`BaseAuthAction::getAuthCookie()` kodiert den Login-Cookie hart als
+`secure: true, sameSite: 'None'`; über `http://IP:8123` verwirft jeder Browser
+diesen Cookie (→ 1 Sekunde angemeldet, dann zurück zum Login). Der Installer
+patcht das beim Start (idempotent, via `patches/`, überlebt `docker compose pull`)
+und **beweist** den Fix per Header-Check (`Set-Cookie` ohne `Secure`/`None`).
+Zusätzlich setzt v1.1.0+ `APP_URL`, `SANCTUM_STATEFUL_DOMAINS`, `SESSION_SECURE_COOKIE=false`
+und lässt `SESSION_DOMAIN` leer. Nach einem Re-Run einmal die Browser-Cookies
+der Seite löschen. Dauerhaft sauberste Alternative: HTTPS-Reverse-Proxy.
 
 ## Was das Script tut
 

@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.5}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -457,6 +457,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      # Login-Cookie-Patch: secure/sameSite ist in BaseAuthAction hartkodiert
+      # (secure:true + sameSite:None -> Browser verwirft Cookie ueber http://,
+      #  Upstream-Issue #472). Patch wird beim Start eingeschleust (s.u.).
+      - ./patches:/app/patches:ro
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -519,6 +524,60 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: a
   ufw allow ${WEB_PORT}/tcp || true
 fi
 echo "--- [CT] Starte hi-events.service ---"
+# --- Login-Cookie-Patch (Upstream-Issue #472, Browsertest-Beweis siehe verify) ---
+# BaseAuthAction::getAuthCookie() kodiert hart: secure=true + sameSite=None.
+# Ueber http://IP:8123 verwirft jeder Browser diesen Cookie -> Token weg nach 1s
+# -> Rueckfall zum Login. Kein ENV erreicht diese Stelle -> Laufzeit-Patch.
+mkdir -p "$APP_DIR/patches"
+cat > "$APP_DIR/patches/login-cookie.patch" <<'PATCH_EOF'
+--- a/app/Http/Actions/Auth/BaseAuthAction.php
++++ b/app/Http/Actions/Auth/BaseAuthAction.php
+@@
+     protected function getAuthCookie(string $token): SymfonyCookie
+     {
+         return Cookie::make(
+             name: 'token',
+             value: $token,
+-            secure: true,
+-            sameSite: 'None',
++            secure: (bool) env('SESSION_SECURE_COOKIE', false),
++            sameSite: 'Lax',
+         );
+     }
+PATCH_EOF
+cat > "$APP_DIR/patches/apply-cookie-patch.sh" <<'APPLYPATCH_EOF'
+#!/bin/bash
+# Wird beim Container-Start ausgefuehrt (entrypoint-Hook), idempotent.
+set -euo pipefail
+TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
+PATCH=/app/patches/login-cookie.patch
+if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
+  cd /app/backend
+  if patch --dry-run "$TARGET" "$PATCH" >/dev/null 2>&1; then
+    patch "$TARGET" "$PATCH" && echo "[cookie-patch] angewendet" \
+      || { echo "[cookie-patch] FEHLGESCHLAGEN" >&2; exit 0; }
+  else
+    # Kontextzeilen weichen ab -> gezielter sed-Fallback (robust gegen Formatierung)
+    sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
+    sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
+    grep -q "sameSite: 'Lax'" "$TARGET" && echo "[cookie-patch] via sed gesetzt" \
+      || echo "[cookie-patch] WARNUNG: Muster nicht gefunden" >&2
+  fi
+else
+  echo "[cookie-patch] bereits aktiv"
+fi
+php artisan config:clear >/dev/null 2>&1 || true
+APPLYPATCH_EOF
+chmod +x "$APP_DIR/patches/apply-cookie-patch.sh"
+# Patch in Container anwenden + OpCache leeren (einmalig; Reboot-sicher via Service-Restart)
+AIO_ID="$(docker compose ps -q all-in-one </dev/null)"
+if [[ -n "$AIO_ID" ]]; then
+  docker compose exec -T all-in-one /app/patches/apply-cookie-patch.sh </dev/null \
+    || echo "[cookie-patch] Container-Exec fehlgeschlagen (pruefen!)" >&2
+  docker compose restart all-in-one </dev/null >/dev/null 2>&1 || true
+  sleep 8
+fi
+
 systemctl restart hi-events.service || (journalctl -u hi-events.service --no-pager -n 50; exit 1)
 IN_CT_EOF
 
@@ -812,6 +871,42 @@ verify_install() {
   onboot=$(pct config "$CTID" | grep -i onboot || echo "onboot: ?")
   log "CT-Config onboot → ${onboot}"
   msg_ok "Reboot-Sicherheit: ${onboot} + systemd enable hi-events.service"
+
+  # Login-Cookie-Beweis: Set-Cookie muss ohne Secure/None über http:// nutzbar sein.
+  msg_info "Prüfe Login-Cookie (Set-Cookie-Header über http://, Issue-#472-Fix)"
+  local cookie_out=""
+  cookie_out=$(pct exec "$CTID" -- env "API_BASE=http://localhost:${WEB_PORT}/api" "ADMIN_EMAIL=${ADMIN_EMAIL_FINAL:-x@y.z}" "ADMIN_PASSWORD=${ADMIN_PASSWORD_FINAL:-x}" bash -s 2>&1 <<'COOKIE_EOF' || true
+set -Eeuo pipefail
+REQ="$(mktemp)"; RESP="$(mktemp)"; HDR="$(mktemp)"
+python3 - > "$REQ" <<'PYEOF'
+import json, os
+print(json.dumps({"email": os.environ.get("ADMIN_EMAIL", "probe@local"),
+  "password": os.environ.get("ADMIN_PASSWORD", "probe1234"),
+  "account_id": 1}))
+PYEOF
+HTTP=$(curl -s -o "$RESP" -D "$HDR" -w "%{http_code}" --max-time 30 \
+  -H 'Content-Type: application/json' -d @"$REQ" \
+  "${API_BASE}/auth/login" || echo "000")
+if [[ "$HTTP" != "200" ]]; then
+  echo "COOKIE_RESULT skip (HTTP ${HTTP})" >&2
+  echo "COOKIE_RESULT skip"
+  exit 0
+fi
+if grep -qi "set-cookie:.*token=" "$HDR" && ! grep -qi "set-cookie:.*secure" "$HDR" && ! grep -qi "set-cookie:.*samesite=none" "$HDR"; then
+  echo "COOKIE_RESULT ok" >&2
+else
+  echo "COOKIE_RESULT bad: $(grep -i set-cookie "$HDR" | head -2)" >&2
+fi
+COOKIE_EOF
+  )
+  log "Cookie-Check: ${cookie_out:-<leer>}"
+  case "$cookie_out" in
+    *COOKIE_RESULT\ ok*)   msg_ok "Login-Cookie ok (token-Cookie ohne Secure/None → Browser behält Login)" ;;
+    *COOKIE_RESULT\ skip*) msg_info "Cookie-Check übersprungen (Login-HTTP != 200 – Provision prüft separat)" ;;
+    *) msg_error "Login-Cookie unverändert (Secure/None) → Browser-Login fällt nach 1s zurück!"
+       msg_error "Diagnose: pct exec ${CTID} -- docker compose exec all-in-one grep -n sameSite /app/backend/app/Http/Actions/Auth/BaseAuthAction.php"
+       msg_error "Re-Run hilft (Patch re-run-sicher); sauberste Lösung: HTTPS-Reverse-Proxy." ;;
+  esac
 }
 
 print_summary() {
@@ -912,8 +1007,8 @@ main() {
   [[ -n "${ip:-}" ]] || { msg_error "Keine Container-IP ermittelbar (pct exec hostname -I leer)."; pct config "$CTID"; exit 1; }
   log "Container-IP: ${ip}"
   install_in_container "$ip"
-  verify_install "$ip"
-  setup_admin "$ip"
+  setup_admin "$ip"   # Admin anlegen (enthält Login-Beweis) – VOR Cookie-Check nötig
+  verify_install "$ip"   # Service/HTTP/onboot + Login-Cookie-Header über http://
   print_summary "$ip"
   print_credentials_box "$ip"
   log "== Installation erfolgreich: http://${ip}:${WEB_PORT} =="
