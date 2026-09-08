@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.2}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -268,16 +268,42 @@ wait_container() {
     pct config "$CTID" || true
     exit 1
   fi
-  msg_info "Warte auf Container-Netzwerk (max. 90s)"
+  msg_info "Warte auf Container-IP (DHCP, max. 60s)"
+  local cip=""
+  for _ in $(seq 1 30); do
+    cip=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)
+    [[ -n "$cip" ]] && break
+    sleep 2
+  done
+  if [[ -z "$cip" && "$NET_CONFIG" == "dhcp" ]]; then
+    msg_info "Keine IP – versuche einmalig DHCP-Renew (dhclient eth0)"
+    pct exec "$CTID" -- dhclient -v eth0 2>&1 | tee -a "$LOG_FILE" || true
+    sleep 5
+    cip=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)
+  fi
+  if [[ -z "$cip" ]]; then
+    msg_error "Container ${CTID} bekommt keine IP (DHCP antwortet nicht?). Netzwerk-Dump:"
+    pct exec "$CTID" -- ip addr 2>&1 || true
+    pct exec "$CTID" -- ip route 2>&1 || true
+    msg_error "Prüfen: Router-DHCP Pool frei / MAC-Filter? vmbr0-Uplink ok? PVE-Firewall?"
+    msg_error "Workaround statische IP: pct destroy ${CTID} (nach stop), dann Re-Run mit --ip 192.168.1.50/24"
+    exit 1
+  fi
+  log "Container-IP: ${cip}"
+  msg_info "Warte auf Internet-Zugang (Ping oder TCP/53, max. 90s)"
   for i in $(seq 1 45); do
-    if pct exec "$CTID" -- bash -c "ping -c1 -W2 1.1.1.1 >/dev/null 2>&1"; then
-      msg_ok "Container-Netzwerk bereit (Versuch ${i})"
+    if pct exec "$CTID" -- bash -c "ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || timeout 5 bash -c '</dev/tcp/1.1.1.1/53'" 2>/dev/null; then
+      msg_ok "Container-Netzwerk bereit (Versuch ${i}, IP ${cip})"
       return 0
     fi
     sleep 2
   done
-  msg_error "Container hat kein Netzwerk (DNS/Ping zu 1.1.1.1 schlägt fehl). pct config:"
-  pct config "$CTID" || true
+  msg_error "Container hat IP (${cip}), aber kein Internet. Netzwerk-Dump:"
+  pct exec "$CTID" -- ip addr 2>&1 || true
+  pct exec "$CTID" -- ip route 2>&1 || true
+  pct exec "$CTID" -- cat /etc/resolv.conf 2>&1 || true
+  msg_error "Prüfen: Gateway/Routes, PVE-Firewall (FORWARD), Host-Test: ping -c1 1.1.1.1"
+  msg_error "DNS-Test im CT: pct exec ${CTID} -- getent hosts github.com"
   exit 1
 }
 
