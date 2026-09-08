@@ -72,7 +72,9 @@ Admin-Passwort (min. 8 Zeichen, leer = zufällig generieren): _
 - Der Admin bekommt die Rolle **SUPERADMIN** (Vollzugriff, inkl. `/admin`-Bereich).
   Der Installer beweist den Login selbst: `POST /auth/login → 200` + `GET /users/me → 200`.
 - Non-interaktiv (kein TTY): E-Mail = `admin@hi-events.local`, Passwort zufällig –
-  beides steht am Ende der Installation auf dem Terminal (nie im Log).
+  beides steht am Ende der Installation als **ZUGANGSDATEN-Block** auf dem Terminal
+  und zusätzlich in `~/hi-events-ct<CTID>.creds` auf dem Proxmox-Host (nur root lesbar).
+  Weder Block noch Datei landen im Install-Log.
 - Eigene Werte ohne Abfrage:
   ```bash
   ADMIN_EMAIL=chef@example.com ADMIN_PASSWORD=supersecret123 \

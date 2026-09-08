@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.1.0}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.2.0}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -780,6 +780,39 @@ print_summary() {
   echo -e "  Reboot-Test : pct reboot ${CTID} && sleep 45 && curl -fsS http://${ip}:${WEB_PORT}/ >/dev/null && echo OK"
 }
 
+# Letzte Ausgabe: unübersehbarer Zugangsdaten-Block + Creds-Datei (nur root lesbar,
+# Community-Scripts-Stil, vgl. paperless-ngx.creds). Passwort steht hier und in der
+# Datei – bewusst NICHT im Install-Log.
+print_credentials_box() {
+  local ip="$1"
+  [[ -n "${ADMIN_EMAIL_FINAL:-}" && -n "${ADMIN_PASSWORD_FINAL:-}" ]] || return 0
+  local login_url="http://${ip}:${WEB_PORT}/auth/login"
+  local dashboard_url="http://${ip}:${WEB_PORT}/manage/events"
+  local creds_file="${HOME:-/root}/hi-events-ct${CTID}.creds"
+  if {
+    echo "Hi.Events Admin-Zugang (CT ${CTID}, Container-IP ${ip}, $(date '+%F %T'))"
+    echo "Login:     ${login_url}"
+    echo "E-Mail:    ${ADMIN_EMAIL_FINAL}"
+    echo "Passwort:  ${ADMIN_PASSWORD_FINAL}"
+    echo "Dashboard (Events einrichten): ${dashboard_url}"
+  } > "$creds_file" 2>/dev/null && chmod 600 "$creds_file" 2>/dev/null; then
+    log "Zugangsdaten gespeichert in ${creds_file} (Modus 600)"
+  else
+    creds_file="(Konnte nicht geschrieben werden – bitte Zugangsdaten unten notieren!)"
+  fi
+  echo ""
+  echo -e "${GN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
+  echo -e "${GN}  Hi.Events ZUGANGSDATEN – bitte notieren!${CL}"
+  echo -e "${GN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
+  echo -e "  Login:     ${BGN}${login_url}${CL}"
+  echo -e "  E-Mail:    ${BGN}${ADMIN_EMAIL_FINAL}${CL}"
+  echo -e "  Passwort:  ${BGN}${ADMIN_PASSWORD_FINAL}${CL}"
+  echo -e "  Events einrichten: ${BGN}${dashboard_url}${CL}"
+  echo -e "${GN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
+  echo -e "  Gespeichert in: ${creds_file} (nur für root lesbar)"
+  echo ""
+}
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -822,6 +855,7 @@ main() {
   verify_install "$ip"
   setup_admin "$ip"
   print_summary "$ip"
+  print_credentials_box "$ip"
   log "== Installation erfolgreich: http://${ip}:${WEB_PORT} =="
 }
 
