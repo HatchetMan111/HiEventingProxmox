@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.3}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -465,6 +465,15 @@ services:
       # (Upstream-Issue #472). Entry-Point-Wrapper wendet den Patch bei JEDEM
       # Container-Start an (auch nach down/up, pull, Reboot) und exec't /startup.sh.
       - ./patches:/app/patches:ro
+    # Eigener Healthcheck (ersetzt den irreführenden des Base-Images, der auch
+    # bei laufender App dauerhaft 'unhealthy' meldet): ehrlich = HTTP 200 auf /.
+    # busybox-wget gibt es in jedem Alpine-Image; start_period deckt Erststart ab.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:80/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -587,26 +596,25 @@ fi
 APPLYPATCH_EOF
 chmod +x "$APP_DIR/patches/entrypoint.sh" "$APP_DIR/patches/apply-cookie-patch.sh"
 
-# Stack hochfahren. BEWUSST ohne '--wait': Der Upstream-Healthcheck (Base-Image)
-# meldet waehrend Erst-Migration/SSR-Start 'unhealthy' (transient!) und --wait
-# wuerde sofort hart abbrechen. Stattdessen tolerante Schleife (max. 300s):
-# 'unhealthy'/'starting' = weiter warten, erst nach Timeout mit Logs sterben.
+# Stack hochfahren. BEWUSST ohne '--wait' und OHNE Health-Gate: Der Upstream-
+# Healthcheck (Base-Image) bleibt auch bei laufender App (HTTP 200) dauerhaft
+# 'unhealthy' – Gate ist HTTP 200 auf / (nginx+SSR), Health nur Diagnose.
 docker compose up -d </dev/null 2>&1 | tail -n 5
 APP_READY=0
 for i in $(seq 1 60); do
   AIO_Q="$(docker compose ps -q all-in-one </dev/null 2>/dev/null || true)"
   AIO_STATE="$(docker inspect -f '{{.State.Health.Status}}' "$AIO_Q" 2>/dev/null || echo '?')"
   HTTP_C="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:${WEB_PORT}/ 2>/dev/null || echo 000)"
-  if [[ "$AIO_STATE" == "healthy" && "$HTTP_C" == "200" ]]; then APP_READY=1; break; fi
-  if (( i % 6 == 0 )); then echo "warte auf App (health=${AIO_STATE:-?}, http=${HTTP_C}, ${i}/60)..."; fi
+  if [[ "$HTTP_C" == "200" ]]; then APP_READY=1; break; fi
+  if (( i % 6 == 0 )); then echo "warte auf App (health=${AIO_STATE:-?} [nur Info], http=${HTTP_C}, ${i}/60)..."; fi
   sleep 5
 done
 if [[ "$APP_READY" != "1" ]]; then
-  msg_error "App nach 300s nicht bereit (health=${AIO_STATE:-?}, http=${HTTP_C:-?}). Compose-Logs:"
+  echo "FEHLER: App nach 300s ohne HTTP 200 (health=${AIO_STATE:-?}, http=${HTTP_C:-?}). Compose-Logs:" >&2
   docker compose logs --tail=40 --no-color 2>/dev/null || true
   exit 1
 fi
-msg_ok "App bereit (health=healthy, http=200)"
+echo "App bereit (http=200, Upstream-Health=${AIO_STATE:-?})"
 
 systemctl restart hi-events.service || (journalctl -u hi-events.service --no-pager -n 50; exit 1)
 IN_CT_EOF
