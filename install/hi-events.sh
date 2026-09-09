@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.4}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.5}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -565,10 +565,12 @@ cat > "$APP_DIR/patches/login-cookie.patch" <<'PATCH_EOF'
      }
 PATCH_EOF
 # (entrypoint-Override entfernt – siehe Hinweis im Compose-Block.)
+# WICHTIG: Alpine kennt KEIN /bin/bash und kein pipefail! Shebang #!/bin/sh,
+# set -eu, nur POSIX-Syntax – sonst 'no such file or directory' beim exec.
 cat > "$APP_DIR/patches/apply-cookie-patch.sh" <<'APPLYPATCH_EOF'
-#!/bin/bash
+#!/bin/sh
 # Login-Cookie-Patch im laufenden Container anwenden (idempotent, Re-Run-sicher).
-set -euo pipefail
+set -eu
 TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
 if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
   [ -f "$TARGET.install-bak" ] || cp "$TARGET" "$TARGET.install-bak" 2>/dev/null || true
