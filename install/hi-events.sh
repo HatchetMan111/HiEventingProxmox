@@ -19,7 +19,7 @@ set -Eeuo pipefail
 # ============================================================================
 APP="${APP:-hi-events}"
 APP_FRIENDLY="${APP_FRIENDLY:-Hi.Events}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.3}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-1.3.4}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/HiEventsDev/hi.events}"
 HI_EVENTS_IMAGE="${HI_EVENTS_IMAGE:-daveearley/hi.events-all-in-one:latest}"
 HI_EVENTS_VERSION="${HI_EVENTS_VERSION:-latest}"   # nur Info/Tag-Doku, Image-Tag steckt in HI_EVENTS_IMAGE
@@ -459,11 +459,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    entrypoint: ["/app/patches/entrypoint.sh"]
+    # HINWEIS: KEIN entrypoint-Override! Das Base-Image-Entrypoint bereitet
+    # php-fpm vor; ein Override ließ php-fpm stumm sterben (nginx 502, v1.3.1).
+    # Der Cookie-Patch wird per exec in den laufenden Container angewendet
+    # (s.u.) und bei jedem Installer-Re-Run erneut sichergestellt.
     volumes:
       # Login-Cookie-Patch: BaseAuthAction kodiert secure:true/sameSite:None hart
-      # (Upstream-Issue #472). Entry-Point-Wrapper wendet den Patch bei JEDEM
-      # Container-Start an (auch nach down/up, pull, Reboot) und exec't /startup.sh.
+      # (Upstream-Issue #472). Dateien liegen im Container (exec-Anwendung s.u.).
       - ./patches:/app/patches:ro
     # Eigener Healthcheck (ersetzt den irreführenden des Base-Images, der auch
     # bei laufender App dauerhaft 'unhealthy' meldet): ehrlich = HTTP 200 auf /.
@@ -542,6 +544,9 @@ echo "--- [CT] Starte hi-events.service ---"
 # -> Rueckfall zum Login. Kein ENV erreicht diese Stelle -> Laufzeit-Patch.
 # entrypoint.sh ummantelt /startup.sh: Patch bei JEDEM Container-Start (idempotent)
 # + Warmup-Warten auf die API, damit Provision/Cookie-Check nie ins Leere laufen.
+# AKTUELL DEAKTIVIERT (auskommentiert erzeugt): Ein entrypoint-Override umgeht das
+# Base-Image-Entrypoint und ließ php-fpm stumm sterben (nginx 502, v1.3.1).
+# Stattdessen: exec-Anwendung im laufenden Container (s.u.), Re-Run-sicher.
 mkdir -p "$APP_DIR/patches"
 cat > "$APP_DIR/patches/login-cookie.patch" <<'PATCH_EOF'
 --- a/app/Http/Actions/Auth/BaseAuthAction.php
@@ -559,42 +564,28 @@ cat > "$APP_DIR/patches/login-cookie.patch" <<'PATCH_EOF'
          );
      }
 PATCH_EOF
-cat > "$APP_DIR/patches/entrypoint.sh" <<'ENTRY_EOF'
-#!/bin/sh
-# Entry-Point-Wrapper (ersetzt /startup.sh als PID 1-Aufgabe):
-# 1) Login-Cookie-Patch anwenden (idempotent), 2) Original-Startup exec'en.
-set -e
+# (entrypoint-Override entfernt – siehe Hinweis im Compose-Block.)
+cat > "$APP_DIR/patches/apply-cookie-patch.sh" <<'APPLYPATCH_EOF'
+#!/bin/bash
+# Login-Cookie-Patch im laufenden Container anwenden (idempotent, Re-Run-sicher).
+set -euo pipefail
 TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
 if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
   [ -f "$TARGET.install-bak" ] || cp "$TARGET" "$TARGET.install-bak" 2>/dev/null || true
   sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
   sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
   if php -l "$TARGET" >/dev/null 2>&1 && grep -q "sameSite: 'Lax'" "$TARGET"; then
-    echo "[cookie-patch] angewendet (php -l ok, secure=ENV-gesteuert, sameSite=Lax)"
+    echo "[cookie-patch] angewendet (php -l ok)"
   else
     cp -f "$TARGET.install-bak" "$TARGET" 2>/dev/null || true
     echo "[cookie-patch] FEHLER: php -l schlägt fehl – Original wiederhergestellt" >&2
+    exit 1
   fi
 else
   echo "[cookie-patch] bereits aktiv"
 fi
-exec /startup.sh
-ENTRY_EOF
-cat > "$APP_DIR/patches/apply-cookie-patch.sh" <<'APPLYPATCH_EOF'
-#!/bin/bash
-# manueller Fallback: Patch nachtraeglich in laufendem Container anwenden.
-set -euo pipefail
-TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
-if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
-  sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
-  sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
-  grep -q "sameSite: 'Lax'" "$TARGET" && echo "[cookie-patch] via sed gesetzt" \
-    || { echo "[cookie-patch] FEHLER: Muster nicht gefunden" >&2; exit 1; }
-else
-  echo "[cookie-patch] bereits aktiv"
-fi
 APPLYPATCH_EOF
-chmod +x "$APP_DIR/patches/entrypoint.sh" "$APP_DIR/patches/apply-cookie-patch.sh"
+chmod +x "$APP_DIR/patches/apply-cookie-patch.sh"
 
 # Stack hochfahren. BEWUSST ohne '--wait' und OHNE Health-Gate: Der Upstream-
 # Healthcheck (Base-Image) bleibt auch bei laufender App (HTTP 200) dauerhaft
@@ -615,6 +606,26 @@ if [[ "$APP_READY" != "1" ]]; then
   exit 1
 fi
 echo "App bereit (http=200, Upstream-Health=${AIO_STATE:-?})"
+
+# Cookie-Patch per exec anwenden (Container läuft garantiert, s.o.), dann
+# all-in-one neu starten (OpCache/Workers frisch) + API-Warmup abwarten.
+echo "--- [CT] Wende Login-Cookie-Patch an ---"
+# HINWEIS: hier NUR echo/exit verwenden – Host-Funktionen (msg_*) existieren
+# im Container NICHT (Exit 127, v1.3.3)!
+docker compose exec -T all-in-one /app/patches/apply-cookie-patch.sh </dev/null \
+  || { echo "FEHLER: Cookie-Patch fehlgeschlagen" >&2; exit 1; }
+docker compose restart all-in-one </dev/null >/dev/null 2>&1 || true
+for i in $(seq 1 36); do
+  HTTP_C2="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:${WEB_PORT}/ 2>/dev/null || echo 000)"
+  [[ "$HTTP_C2" == "200" ]] && break
+  if (( i % 6 == 0 )); then echo "warte auf API nach Patch-Restart (http=${HTTP_C2}, ${i}/36)..."; fi
+  sleep 5
+done
+if [[ "$HTTP_C2" != "200" ]]; then
+  echo "FEHLER: API nach Patch-Restart ohne HTTP 200" >&2
+  docker compose logs --tail=30 --no-color 2>/dev/null || true
+  exit 1
+fi
 
 systemctl restart hi-events.service || (journalctl -u hi-events.service --no-pager -n 50; exit 1)
 IN_CT_EOF
@@ -756,6 +767,29 @@ PSQL=(docker compose exec -T -e "PGPASSWORD=${POSTGRES_PASSWORD}" postgres psql 
 SQL_EMAIL="${ADMIN_EMAIL//\'/\'\'}"
 
 # --- 1) Registrieren (201) oder existierenden User übernehmen (422 = E-Mail belegt) ---
+# Transient-Retry-Helfer: 000/502/503/504 (fpm-Warmup, Restart) mit Backoff
+# erneut versuchen, max. ~2 Min. Ergebnis in $RETRY_HTTP. Body bleibt in Datei.
+# Aufruf: api_retry <beschreibung> <curl-args...>; Antwort-Body landet in $RETRY_BODY.
+RETRY_BODY=""; RETRY_HTTP="000"
+api_retry() {
+  local desc="$1"; shift
+  RETRY_BODY="$(mktemp)"; RETRY_HTTP="000"
+  local i
+  for i in $(seq 1 12); do
+    RETRY_HTTP=$(curl -s -o "$RETRY_BODY" -w "%{http_code}" --max-time 15 "$@" 2>/dev/null || echo "000")
+    case "$RETRY_HTTP" in
+      000|502|503|504) log_ct "${desc} → HTTP ${RETRY_HTTP} (transient, Versuch ${i}/12)..."; sleep 10 ;;
+      *) log_ct "${desc} → HTTP ${RETRY_HTTP}"; break ;;
+    esac
+  done
+}
+# PHP-FPM-Tiefendiagnose bei API-Problemen (nginx 502 = fpm antwortet nicht):
+dump_php_state() {
+  log_ct "PHP-FPM-Diagnose:"
+  docker compose exec -T all-in-one sh -c 'ps aux | grep -E "php-fpm|supervisord" | grep -v grep; echo ---; php-fpm -t 2>&1 | head -5; echo ---; php -l /app/backend/app/Http/Actions/Auth/BaseAuthAction.php 2>&1' </dev/null >&2 || true
+  log_ct "nginx-Upstream-Fehler (compose-Logs):"
+  docker compose logs --tail=30 all-in-one 2>/dev/null | grep -aiE 'connect\(\) failed|upstream|FastCGI sent|primary script unknown' | tail -n 10 >&2 || true
+}
 REQ="$(mktemp)"; RESP="$(mktemp)"
 python3 - > "$REQ" <<'PYEOF'
 import json, os
@@ -768,9 +802,8 @@ print(json.dumps({
     "timezone": os.environ.get("TIMEZONE", "Europe/Berlin"),
 }))
 PYEOF
-REG_HTTP=$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 \
-  -H 'Content-Type: application/json' -d @"$REQ" "${API_BASE}/auth/register" || echo "000")
-log_ct "POST /auth/register → HTTP ${REG_HTTP}"
+api_retry "POST /auth/register" -H 'Content-Type: application/json' -d @"$REQ" "${API_BASE}/auth/register"
+REG_HTTP="$RETRY_HTTP"; RESP="$RETRY_BODY"
 # IDs grundsätzlich aus der DB lesen (robust gegen Antwort-Formatänderungen):
 lookup_ids() {
   USER_ID="$("${PSQL[@]}" "SELECT id FROM users WHERE email='${SQL_EMAIL}' LIMIT 1" </dev/null 2>/dev/null | tr -d '[:space:]')" || true
@@ -796,7 +829,8 @@ elif [[ "${REG_HTTP}" == "422" ]] && grep -qiE 'email|taken|exists' "$RESP"; the
   "${PSQL[@]}" "UPDATE users SET password='${BCRYPT}', updated_at=NOW() WHERE id=${USER_ID}" </dev/null
   log_ct "Passwort für User ${USER_ID} gesetzt"
 else
-  fail_ct "Registrierung fehlgeschlagen (HTTP ${REG_HTTP}). Antwort: $(cat "$RESP")"
+  dump_php_state
+  fail_ct "Registrierung fehlgeschlagen (HTTP ${REG_HTTP}). Antwort: $(head -c 500 "$RESP")"
 fi
 [[ -n "${USER_ID:-}" && -n "${ACCOUNT_ID:-}" ]] || fail_ct "User-/Account-ID leer"
 log_ct "User-ID ${USER_ID}, Account-ID ${ACCOUNT_ID}"
@@ -828,8 +862,8 @@ import json, os
 print(json.dumps({"email": os.environ["ADMIN_EMAIL"],
   "password": os.environ["ADMIN_PASSWORD"], "account_id": int(os.environ["ACCOUNT_ID"])}))
 PYEOF
-LOGIN_HTTP=$(curl -s -o "$LRESP" -w "%{http_code}" --max-time 30 \
-  -H 'Content-Type: application/json' -d @"$LREQ" "${API_BASE}/auth/login" || echo "000")
+api_retry "POST /auth/login" -H 'Content-Type: application/json' -d @"$LREQ" "${API_BASE}/auth/login"
+LOGIN_HTTP="$RETRY_HTTP"; LRESP="$RETRY_BODY"
 TOKEN="$(python3 - "$LRESP" <<'PYEOF'
 import json, sys
 try:
@@ -856,12 +890,21 @@ PYEOF
 )"
 if [[ "${LOGIN_HTTP}" != "200" || -z "$TOKEN" ]]; then
   KEYS="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(list(d.keys()) if isinstance(d,dict) else type(d).__name__)' "$LRESP" 2>/dev/null || echo '?')"
+  dump_php_state
   fail_ct "Login-Beweis fehlgeschlagen (HTTP ${LOGIN_HTTP}). Top-Level-Keys: ${KEYS}. Anfang der Antwort: $(head -c 300 "$LRESP")"
 fi
-ME_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
-  -H "Authorization: Bearer ${TOKEN}" "${API_BASE}/users/me" || echo "000")
+ME_BODY="$(mktemp)"
+ME_HTTP="000"
+for i in $(seq 1 12); do
+  ME_HTTP=$(curl -s -o "$ME_BODY" -w "%{http_code}" --max-time 15 \
+    -H "Authorization: Bearer ${TOKEN}" "${API_BASE}/users/me" 2>/dev/null || echo "000")
+  case "$ME_HTTP" in
+    000|502|503|504) log_ct "GET /users/me → HTTP ${ME_HTTP} (transient, Versuch ${i}/12)..."; sleep 10 ;;
+    *) break ;;
+  esac
+done
 [[ "${ME_HTTP}" == "200" ]] \
-  || fail_ct "GET /users/me → HTTP ${ME_HTTP} (erwartet 200, Upstream-Issue #472)"
+  || { dump_php_state; fail_ct "GET /users/me → HTTP ${ME_HTTP} (erwartet 200, Upstream-Issue #472)"; }
 log_ct "Login-Beweis ok: /auth/login 200 + /users/me 200"
 
 # Ergebnis doppelt sichern: stdout (Log) + Datei (robust gegen Pipe-Abbrüche).
