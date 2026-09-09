@@ -101,14 +101,16 @@ EOF
 # FEHLERHANDLER – komplette Fehlermeldungskette (niemals nur letzte Zeile)
 # ============================================================================
 error_trap() {
-  local exit_code=$?
+  # EINE Anweisung: nur so bleiben $? UND PIPESTATUS gleichzeitig korrekt
+  # (jedes weitere Statement davor würde PIPESTATUS auf [0] zurücksetzen).
+  local exit_code=$? pipe_status="${PIPESTATUS[*]:-n/a}"
   local failed_cmd="${BASH_COMMAND:-unbekannt}"
   echo "" >&2
   msg_error "INSTALLATION FEHLGESCHLAGEN (Exit-Code: ${exit_code})"
   echo -e "${YW}--- Fehlermeldungskette (vollständig) ---${CL}" >&2
   echo "  Befehl    : ${failed_cmd}" >&2
   echo "  Exit-Code : ${exit_code}" >&2
-  echo "  Pipe-Status: ${PIPESTATUS[*]:-n/a} (bei Pipelines: Austrittscodes aller Glieder)" >&2
+  echo "  Pipe-Status: ${pipe_status} (bei Pipelines: Austrittscodes aller Glieder)" >&2
   echo "  Zeile     : ${BASH_LINENO[0]:-?} (Funktion: ${FUNCNAME[1]:-main})" >&2
   echo "  Stacktrace:" >&2
   local i=0 frame
@@ -555,11 +557,15 @@ cat > "$APP_DIR/patches/entrypoint.sh" <<'ENTRY_EOF'
 set -e
 TARGET=/app/backend/app/Http/Actions/Auth/BaseAuthAction.php
 if grep -q "sameSite: 'None'" "$TARGET" 2>/dev/null; then
+  [ -f "$TARGET.install-bak" ] || cp "$TARGET" "$TARGET.install-bak" 2>/dev/null || true
   sed -i "s/secure: true,/secure: (bool) env('SESSION_SECURE_COOKIE', false),/" "$TARGET"
   sed -i "s/sameSite: 'None',/sameSite: 'Lax',/" "$TARGET"
-  grep -q "sameSite: 'Lax'" "$TARGET" \
-    && echo "[cookie-patch] angewendet (secure=ENV-gesteuert, sameSite=Lax)" \
-    || echo "[cookie-patch] WARNUNG: Muster nicht gefunden" >&2
+  if php -l "$TARGET" >/dev/null 2>&1 && grep -q "sameSite: 'Lax'" "$TARGET"; then
+    echo "[cookie-patch] angewendet (php -l ok, secure=ENV-gesteuert, sameSite=Lax)"
+  else
+    cp -f "$TARGET.install-bak" "$TARGET" 2>/dev/null || true
+    echo "[cookie-patch] FEHLER: php -l schlägt fehl – Original wiederhergestellt" >&2
+  fi
 else
   echo "[cookie-patch] bereits aktiv"
 fi
@@ -581,25 +587,28 @@ fi
 APPLYPATCH_EOF
 chmod +x "$APP_DIR/patches/entrypoint.sh" "$APP_DIR/patches/apply-cookie-patch.sh"
 
-# Stack hochfahren. WICHTIG: 'up -d' NICHT 'up' (foreground) — service-Unit
-# startet 'up' (attach), hier fuer Setup einmal detachted + auf Health warten.
-docker compose up -d --wait </dev/null 2>&1 | tail -n 5
-# --wait wartet auf healthy; fallback-schleife (aeltere compose):
+# Stack hochfahren. BEWUSST ohne '--wait': Der Upstream-Healthcheck (Base-Image)
+# meldet waehrend Erst-Migration/SSR-Start 'unhealthy' (transient!) und --wait
+# wuerde sofort hart abbrechen. Stattdessen tolerante Schleife (max. 300s):
+# 'unhealthy'/'starting' = weiter warten, erst nach Timeout mit Logs sterben.
+docker compose up -d </dev/null 2>&1 | tail -n 5
+APP_READY=0
 for i in $(seq 1 60); do
-  AIO_STATE="$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q all-in-one </dev/null)" 2>/dev/null || echo '?')"
-  [[ "$AIO_STATE" == "healthy" ]] && break
+  AIO_Q="$(docker compose ps -q all-in-one </dev/null 2>/dev/null || true)"
+  AIO_STATE="$(docker inspect -f '{{.State.Health.Status}}' "$AIO_Q" 2>/dev/null || echo '?')"
+  HTTP_C="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:${WEB_PORT}/ 2>/dev/null || echo 000)"
+  if [[ "$AIO_STATE" == "healthy" && "$HTTP_C" == "200" ]]; then APP_READY=1; break; fi
+  if (( i % 6 == 0 )); then echo "warte auf App (health=${AIO_STATE:-?}, http=${HTTP_C}, ${i}/60)..."; fi
   sleep 5
 done
-echo "all-in-one Health: ${AIO_STATE:-unbekannt}"
+if [[ "$APP_READY" != "1" ]]; then
+  msg_error "App nach 300s nicht bereit (health=${AIO_STATE:-?}, http=${HTTP_C:-?}). Compose-Logs:"
+  docker compose logs --tail=40 --no-color 2>/dev/null || true
+  exit 1
+fi
+msg_ok "App bereit (health=healthy, http=200)"
 
 systemctl restart hi-events.service || (journalctl -u hi-events.service --no-pager -n 50; exit 1)
-# Nach Service-Restart (compose down + up) erneut auf API-Bereitschaft warten:
-for i in $(seq 1 60); do
-  HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:${WEB_PORT}/api/auth/login 2>/dev/null || echo 000)"
-  [[ "$HTTP_CODE" =~ ^(200|405|400|422|404)$ ]] && break
-  sleep 5
-done
-echo "API nach Restart: HTTP ${HTTP_CODE:-000}"
 IN_CT_EOF
 
   msg_ok "In-Container-Setup abgeschlossen"
